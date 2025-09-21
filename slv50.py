@@ -281,7 +281,6 @@ class OptimizedProxyServer:
     async def handle_client(self, client_reader: asyncio.StreamReader, 
                            client_writer: asyncio.StreamWriter):
         """处理客户端连接（优化版）"""
-        start_time = time.monotonic()
         client_addr = client_writer.get_extra_info('peername')
         
         await self.stats.update_connections_nowait(1)
@@ -318,10 +317,6 @@ class OptimizedProxyServer:
             )
             
             await asyncio.gather(pipe1, pipe2)
-            
-            # 记录延迟
-            latency = time.monotonic() - start_time
-            self.perf_metrics['avg_latency'].append(latency)
             
         except Exception as e:
             if self.config.log_connections:
@@ -407,20 +402,17 @@ class OptimizedProxyServer:
             last_bytes_sent = self.stats.bytes_sent
             last_bytes_received = self.stats.bytes_received
             
-            # 计算平均延迟
-            avg_latency = (sum(self.perf_metrics['avg_latency']) / 
-                          len(self.perf_metrics['avg_latency'])) if self.perf_metrics['avg_latency'] else 0
-            
             # 格式化输出
             uptime = f"[{int(elapsed//3600):02d}h{int((elapsed%3600)//60):02d}m{int(elapsed%60):02d}s]"
-            sent = f"↑{self._format_bytes(self.stats.bytes_sent)}"
-            recv = f"↓{self._format_bytes(self.stats.bytes_received)}"
-            speed = f"Speed: ↑{self._format_bytes(upload_speed)}/s ↓{self._format_bytes(download_speed)}/s"
+            total_traffic = (f"↑{self._format_bytes(self.stats.bytes_sent)} "
+                             f"↓{self._format_bytes(self.stats.bytes_received)}")
+            upload_speed_str = f"↑{self._format_bytes(upload_speed)}/s"
+            download_speed_str = f"↓{self._format_bytes(download_speed)}/s"
+            speed = f"Speed: {upload_speed_str:<14} {download_speed_str}"
             conns = f"Conns: {self.stats.current_connections}/{self.stats.peak_connections}"
-            latency = f"Avg Latency: {avg_latency*1000:.1f}ms" if avg_latency > 0 else ""
-            
-            self.logger.info(f"{uptime} {sent} {recv} | {speed} | {conns}", 
-                           extra={'log_type': 'stats'})
+            # Pad total_traffic for '|' alignment, and upload_speed_str is padded within 'speed'
+            self.logger.info(f"{uptime} {total_traffic:<24} | {speed} | {conns}",
+                             extra={'log_type': 'stats'})
     
     def _log_final_stats(self):
         """记录最终统计"""
@@ -428,8 +420,6 @@ class OptimizedProxyServer:
         recv = self._format_bytes(self.stats.bytes_received)
         
         # 计算平均指标
-        avg_latency = (sum(self.perf_metrics['avg_latency']) / 
-                      len(self.perf_metrics['avg_latency'])) if self.perf_metrics['avg_latency'] else 0
         avg_throughput = (sum(self.perf_metrics['throughput']) / 
                          len(self.perf_metrics['throughput'])) if self.perf_metrics['throughput'] else 0
         
@@ -437,8 +427,6 @@ class OptimizedProxyServer:
         self.logger.info(f"Total connections: {self.stats.total_connections}")
         self.logger.info(f"Peak concurrent connections: {self.stats.peak_connections}")
         self.logger.info(f"Total data: ↑{sent} ↓{recv}")
-        if avg_latency > 0:
-            self.logger.info(f"Average latency: {avg_latency*1000:.1f}ms")
         if avg_throughput > 0:
             self.logger.info(f"Average throughput: {self._format_bytes(avg_throughput)}/s")
         self.logger.info(f"============================")
@@ -446,13 +434,18 @@ class OptimizedProxyServer:
     @staticmethod
     def _format_bytes(size: float) -> str:
         """格式化字节数"""
-        if size < 1024: 
-            return f"{size:.0f}B"
-        for unit in ['KB', 'MB', 'GB', 'TB']:
-            size /= 1024.0
-            if size < 1024.0: 
-                return f"{size:.2f}{unit}"
-        return f"{size:.2f}PB"
+        if size < 1024:
+            s = f"{size:.0f}B"
+        else:
+            for unit in ['KB', 'MB', 'GB', 'TB']:
+                size /= 1024.0
+                if size < 1024.0:
+                    s = f"{size:.2f}{unit}"
+                    break
+            else: # Should not be reached unless size is huge (PB+)
+                s = f"{size:.2f}PB"
+        # Return the string right-aligned in a 9-character field
+        return f"{s:>9}"
     
     async def _run_proxy_test(self):
         """运行代理测试"""
