@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 import sys
 import asyncio
-if sys.platform == "win32":
-    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 import argparse
 import logging
 import os
 import time
+import socket
 from dataclasses import dataclass, field
 from typing import Optional, Dict, List
 import traceback
@@ -49,13 +48,14 @@ class LockFreeStats:
     
     async def _batch_update_worker(self):
         """批量处理统计更新，减少锁竞争"""
+        loop = asyncio.get_running_loop()
         while True:
             updates = []
             try:
                 # 批量收集更新（最多等待0.1秒或100条）
-                deadline = asyncio.get_event_loop().time() + 0.1
+                deadline = loop.time() + 0.1
                 while len(updates) < 100:
-                    timeout = deadline - asyncio.get_event_loop().time()
+                    timeout = deadline - loop.time()
                     if timeout <= 0:
                         break
                     update = await asyncio.wait_for(
@@ -82,7 +82,7 @@ class LockFreeStats:
                                 self.current_connections
                             )
     
-    async def add_traffic_nowait(self, sent: int = 0, received: int = 0):
+    def add_traffic_nowait(self, sent: int = 0, received: int = 0):
         """非阻塞地添加流量统计"""
         try:
             if sent > 0:
@@ -93,7 +93,7 @@ class LockFreeStats:
             # 队列满时直接丢弃统计（在高负载下可接受）
             pass
     
-    async def update_connections_nowait(self, delta: int):
+    def update_connections_nowait(self, delta: int):
         """非阻塞地更新连接数"""
         try:
             self._pending_updates.put_nowait(('connection', delta))
@@ -112,11 +112,16 @@ class SSHConnectionPool:
         self.logger = logging.getLogger(self.__class__.__name__)
     
     async def initialize(self):
-        """初始化连接池"""
-        for i in range(self.pool_size):
+        """初始化连接池（并发建立）"""
+        self.connections = [None] * self.pool_size
+        self.connection_usage = [0] * self.pool_size
+
+        async def init_one(i: int):
             conn = await self._create_connection(i)
-            self.connections.append(conn)
-            self.connection_usage.append(0)
+            self.connections[i] = conn
+            self.connection_usage[i] = 0
+        
+        await asyncio.gather(*(init_one(i) for i in range(self.pool_size)))
     
     async def _create_connection(self, index: int) -> Optional[asyncssh.SSHClientConnection]:
         """创建单个SSH连接"""
@@ -127,7 +132,11 @@ class SSHConnectionPool:
                 username=self.config.ssh_user,
                 password=self.config.ssh_password,
                 client_keys=[self.config.ssh_key] if self.config.ssh_key else None,
-                known_hosts=None
+                known_hosts=None,
+                keepalive_interval=30,
+                keepalive_count_max=3,
+                # 优先选择更快的加密套件（多数 Windows CPU 有 AES-NI；无则 chacha 更优）
+                encryption_algs=['aes128-gcm@openssh.com', 'chacha20-poly1305@openssh.com']
             ), timeout=15)
             self.logger.info(f"✓ SSH connection #{index} established")
             return conn
@@ -136,9 +145,9 @@ class SSHConnectionPool:
             return None
     
     async def get_connection(self) -> Optional[asyncssh.SSHClientConnection]:
-        """获取负载最低的可用连接"""
+        """获取负载最低的可用连接（锁内只选择，锁外重连坏连接）"""
+        to_reconnect = []
         async with self._lock:
-            # 查找使用次数最少的活跃连接
             best_idx = -1
             min_usage = float('inf')
             
@@ -147,18 +156,26 @@ class SSHConnectionPool:
                     if self.connection_usage[i] < min_usage:
                         min_usage = self.connection_usage[i]
                         best_idx = i
-                elif conn is None or conn.is_closed():
-                    # 尝试重建死连接
-                    self.connections[i] = await self._create_connection(i)
-                    if self.connections[i]:
-                        self.connection_usage[i] = 0
-                        return self.connections[i]
+                else:
+                    to_reconnect.append(i)
             
             if best_idx >= 0:
                 self.connection_usage[best_idx] += 1
-                return self.connections[best_idx]
-            
-            return None
+                chosen = self.connections[best_idx]
+            else:
+                chosen = None
+
+        # 锁外触发重连（后台）
+        for i in to_reconnect:
+            asyncio.create_task(self._reconnect(i))
+        
+        return chosen
+
+    async def _reconnect(self, index: int):
+        conn = await self._create_connection(index)
+        async with self._lock:
+            self.connections[index] = conn
+            self.connection_usage[index] = 0
     
     async def release_connection(self, conn: asyncssh.SSHClientConnection):
         """释放连接（减少使用计数）"""
@@ -283,7 +300,15 @@ class OptimizedProxyServer:
         """处理客户端连接（优化版）"""
         client_addr = client_writer.get_extra_info('peername')
         
-        await self.stats.update_connections_nowait(1)
+        # Windows/通用：降低小包延迟
+        try:
+            sock = client_writer.get_extra_info('socket')
+            if sock is not None:
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except Exception:
+            pass
+
+        self.stats.update_connections_nowait(1)
         
         if self.config.log_connections:
             self.logger.info(f"Connection from {client_addr}")
@@ -304,16 +329,20 @@ class OptimizedProxyServer:
                 self.config.remote_proxy_port
             )
             
-            # 创建自适应缓冲区
-            c2s_buffer = AdaptiveBuffer() if self.config.buffer_size == 'adaptive' else None
-            s2c_buffer = AdaptiveBuffer() if self.config.buffer_size == 'adaptive' else None
+            # 创建自适应缓冲区（C->S 小延迟，S->C 大吞吐）
+            if self.config.buffer_size == 'adaptive':
+                c2s_buffer = AdaptiveBuffer(min_size=4096, max_size=131072)      # 4KB~128KB
+                s2c_buffer = AdaptiveBuffer(min_size=65536, max_size=1048576)   # 64KB~1MB
+            else:
+                c2s_buffer = None
+                s2c_buffer = None
             
-            # 并行数据传输
+            # 并行数据传输（合并 drain）
             pipe1 = self._optimized_pipe_data(
-                client_reader, remote_writer, 'C->S', c2s_buffer
+                client_reader, remote_writer, 'C->S', c2s_buffer, drain_threshold=32*1024
             )
             pipe2 = self._optimized_pipe_data(
-                remote_reader, client_writer, 'S->C', s2c_buffer
+                remote_reader, client_writer, 'S->C', s2c_buffer, drain_threshold=128*1024
             )
             
             await asyncio.gather(pipe1, pipe2)
@@ -322,25 +351,34 @@ class OptimizedProxyServer:
             if self.config.log_connections:
                 self.logger.debug(f"[{client_addr}] Connection error: {e}")
         finally:
-            # 清理资源
+            # 清理资源：此处完成最终关闭
             if remote_writer:
-                remote_writer.close()
-                await remote_writer.wait_closed()
+                try:
+                    if not remote_writer.is_closing():
+                        remote_writer.close()
+                    await remote_writer.wait_closed()
+                except Exception:
+                    pass
             
             if not client_writer.is_closing():
                 client_writer.close()
-                await client_writer.wait_closed()
+                try:
+                    await client_writer.wait_closed()
+                except Exception:
+                    pass
             
             if ssh_conn:
                 await self.ssh_pool.release_connection(ssh_conn)
             
-            await self.stats.update_connections_nowait(-1)
+            self.stats.update_connections_nowait(-1)
     
     async def _optimized_pipe_data(self, reader: asyncio.StreamReader, 
                                   writer: asyncio.StreamWriter, 
                                   direction: str,
-                                  adaptive_buffer: Optional[AdaptiveBuffer] = None):
-        """优化的数据传输管道"""
+                                  adaptive_buffer: Optional[AdaptiveBuffer] = None,
+                                  drain_threshold: int = 65536):
+        """优化的数据传输管道（合并 drain + 半关闭）"""
+        bytes_since_drain = 0
         try:
             while not reader.at_eof() and not writer.is_closing():
                 # 动态缓冲区大小
@@ -352,33 +390,60 @@ class OptimizedProxyServer:
                     break
                 
                 writer.write(data)
-                await writer.drain()
+                bytes_since_drain += len(data)
+                if bytes_since_drain >= drain_threshold:
+                    await writer.drain()
+                    bytes_since_drain = 0
                 
                 # 更新统计（非阻塞）
                 if direction == 'C->S':
-                    await self.stats.add_traffic_nowait(sent=len(data))
+                    self.stats.add_traffic_nowait(sent=len(data))
                 else:
-                    await self.stats.add_traffic_nowait(received=len(data))
+                    self.stats.add_traffic_nowait(received=len(data))
                 
                 # 调整缓冲区大小
                 if adaptive_buffer:
                     elapsed = time.monotonic() - start_time
                     adaptive_buffer.adjust_size(len(data), elapsed)
+                else:
+                    elapsed = time.monotonic() - start_time
                 
                 # 记录吞吐量
-                if len(data) > 0 and (time.monotonic() - start_time) > 0:
-                    throughput = len(data) / (time.monotonic() - start_time)
-                    self.perf_metrics['throughput'].append(throughput)
+                if len(data) > 0 and elapsed > 0:
+                    self.perf_metrics['throughput'].append(len(data) / elapsed)
                     
         except (OSError, asyncssh.Error, ConnectionResetError, BrokenPipeError):
             pass
         finally:
-            if not writer.is_closing():
-                writer.close()
-                try:
-                    await writer.wait_closed()
-                except:
-                    pass
+            # 尽量把已写数据刷出
+            try:
+                if bytes_since_drain > 0 and not writer.is_closing():
+                    await writer.drain()
+            except Exception:
+                pass
+            # 半关闭优先，避免阻塞另一方向
+            try:
+                if not writer.is_closing():
+                    if hasattr(writer, 'can_write_eof') and writer.can_write_eof():
+                        try:
+                            writer.write_eof()
+                            await writer.drain()
+                        except Exception:
+                            # 某些传输不支持 EOF 或远端已关闭
+                            try:
+                                writer.close()
+                            except Exception:
+                                pass
+                    else:
+                        writer.close()
+                # 注意：如果只 write_eof，不要在这里 wait_closed（避免死锁 gather）
+                if writer.is_closing():
+                    try:
+                        await writer.wait_closed()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
     
     async def _monitor_performance(self):
         """性能监控任务"""
@@ -586,11 +651,27 @@ Examples:
     # 调试选项
     parser.add_argument('--debug', action='store_true',
                        help='Enable debug logging')
+
+    # Windows 事件循环策略（可选）
+    if sys.platform == "win32":
+        parser.add_argument('--win-policy', choices=['auto', 'selector', 'proactor'],
+                            default='selector',
+                            help='Windows event loop policy (default: selector). Try proactor for throughput.')
     
     args = parser.parse_args()
     
-    # Windows颜色支持
+    # Windows事件循环与颜色支持
     if sys.platform == "win32":
+        # 事件循环策略选择
+        policy = getattr(args, 'win_policy', 'selector')
+        try:
+            if policy == 'selector':
+                asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+            elif policy == 'proactor':
+                asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+            # auto: 不设置，使用默认
+        except Exception:
+            pass
         try:
             import colorama
             colorama.init()
