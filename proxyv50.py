@@ -4,11 +4,10 @@ import sys
 import socket
 import ipaddress
 import time
-import hashlib
 import base64
 import json
 from typing import Tuple, Dict, Any, List, Optional, NamedTuple
-from urllib.parse import urlparse, urljoin
+from urllib.parse import urlparse
 from dataclasses import dataclass, field
 from collections import OrderedDict
 from dns import message as dns_message
@@ -16,9 +15,16 @@ import colorama
 import aiohttp
 from aiohttp.abc import AbstractResolver
 import ssl
-import certifi
 import logging
 from logging.handlers import RotatingFileHandler
+
+# Linux: use uvloop for higher throughput (if available)
+if sys.platform.startswith('linux'):
+    try:
+        import uvloop
+        asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+    except Exception:
+        pass
 
 # =========================
 # 初始化
@@ -60,6 +66,9 @@ class ProxyConfig:
     verbose: int = 0
     blacklist_domains: List[str] = field(default_factory=list)
     whitelist_domains: List[str] = field(default_factory=list)
+    # 新增：出站连接偏好与端口复用（Linux）
+    prefer_ipv4: bool = True
+    reuse_port: Optional[bool] = None  # None=按平台默认（Linux=True，其他=False）
 
     @classmethod
     def from_file(cls, config_file: str) -> 'ProxyConfig':
@@ -348,19 +357,34 @@ async def handle_websocket(
         
         # 双向转发数据
         async def forward(reader, writer, direction):
+            bytes_since_drain = 0
             try:
                 while True:
                     data = await reader.read(8192)
                     if not data:
                         break
                     writer.write(data)
-                    await writer.drain()
+                    bytes_since_drain += len(data)
+                    if bytes_since_drain >= 64 * 1024:
+                        await writer.drain()
+                        bytes_since_drain = 0
                     if direction == 'client->target':
                         await stats.record_bytes(len(data), 0)
                     else:
                         await stats.record_bytes(0, len(data))
             except Exception as e:
                 logger.debug(f"WebSocket forwarding error ({direction}): {e}")
+            finally:
+                try:
+                    if bytes_since_drain:
+                        await writer.drain()
+                    if hasattr(writer, 'can_write_eof') and writer.can_write_eof():
+                        writer.write_eof()
+                        await writer.drain()
+                    else:
+                        writer.close()
+                except Exception:
+                    pass
         
         await asyncio.gather(
             forward(client_reader, target_writer, 'client->target'),
@@ -374,7 +398,7 @@ async def handle_websocket(
             target_writer.close()
 
 # =========================
-# 改进的DoH解析器
+# 改进的DoH解析器（用于 aiohttp）
 # =========================
 class EnhancedDohResolver(AbstractResolver):
     def __init__(self, config: ProxyConfig, dns_cache: LRUDNSCache, 
@@ -417,7 +441,6 @@ class EnhancedDohResolver(AbstractResolver):
             return None
         
         try:
-            # 这里复用原来的DoH查询逻辑
             return await resolve_with_doh(
                 hostname, qtype, self.config.doh_server, 
                 self.doh_session, self.logger
@@ -453,12 +476,26 @@ class ProxyServer:
         # 初始化会话
         await self._init_sessions()
         
-        # 启动服务器
-        self.server = await asyncio.start_server(
-            self._handle_client,
-            self.config.host,
-            self.config.port
-        )
+        # 启动服务器（Linux: backlog/reuse_port/TFO；其它平台自动回退）
+        use_reuse_port = (sys.platform.startswith('linux') and (self.config.reuse_port if self.config.reuse_port is not None else True))
+        try:
+            self.server = await asyncio.start_server(
+                self._handle_client,
+                self.config.host,
+                self.config.port,
+                backlog=2048,
+                reuse_port=use_reuse_port
+            )
+            if sys.platform.startswith('linux'):
+                for s in self.server.sockets or []:
+                    try:
+                        TCP_FASTOPEN = getattr(socket, "TCP_FASTOPEN", 23)
+                        s.setsockopt(socket.IPPROTO_TCP, TCP_FASTOPEN, 4096)
+                    except Exception:
+                        pass
+        except Exception as e:
+            self.logger.warning(f"start_server with reuse_port/backlog failed ({e}), falling back to defaults")
+            self.server = await asyncio.start_server(self._handle_client, self.config.host, self.config.port)
         
         # 启动统计报告任务
         asyncio.create_task(self._report_stats())
@@ -500,10 +537,15 @@ class ProxyServer:
                 ttl_dns_cache=self.config.dns_cache_ttl
             )
         
+        # 更合理的超时配置：避免 total=connect_timeout 导致大文件下载被提前中断
         self.http_session = aiohttp.ClientSession(
             connector=connector,
             auto_decompress=False,
-            timeout=aiohttp.ClientTimeout(total=self.config.connect_timeout)
+            timeout=aiohttp.ClientTimeout(
+                connect=self.config.connect_timeout,
+                sock_connect=self.config.connect_timeout,
+                sock_read=None  # 或设为较大的值，如 300
+            )
         )
     
     async def _handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
@@ -513,6 +555,17 @@ class ProxyServer:
         
         try:
             self.logger.info(f"[{conn_id}] New connection from {writer.get_extra_info('peername')}")
+            
+            # 入站 socket 低延迟设置
+            try:
+                csock = writer.get_extra_info('socket')
+                if csock:
+                    csock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                    if sys.platform.startswith('linux') and hasattr(socket, "TCP_QUICKACK"):
+                        csock.setsockopt(socket.IPPROTO_TCP, socket.TCP_QUICKACK, 1)
+                    csock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            except Exception:
+                pass
             
             # 处理请求
             await self._process_client_requests(reader, writer, conn_id)
@@ -639,12 +692,23 @@ class ProxyServer:
             
             self.logger.info(f"[{conn_id}] CONNECT to {host}:{port}")
             
-            # 连接目标服务器
+            # 连接目标服务器（DoH/系统解析 + 并发抢“首个成功连接”）
             async with self.semaphore:
                 target_reader, target_writer = await asyncio.wait_for(
-                    asyncio.open_connection(host, port),
+                    self._connect_happy_eyeballs(host, port, self.config.connect_timeout),
                     timeout=self.config.connect_timeout
                 )
+            
+            # 出站 socket 低延迟设置
+            try:
+                tsock = target_writer.get_extra_info('socket')
+                if tsock:
+                    tsock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                    if sys.platform.startswith('linux') and hasattr(socket, "TCP_QUICKACK"):
+                        tsock.setsockopt(socket.IPPROTO_TCP, socket.TCP_QUICKACK, 1)
+                    tsock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            except Exception:
+                pass
             
             # 发送200响应
             writer.write(b"HTTP/1.1 200 Connection established\r\n\r\n")
@@ -718,13 +782,19 @@ class ProxyServer:
                     writer, response.headers, request['version'], headers
                 )
                 
-                # 写入响应体
+                # 写入响应体（阈值合并 drain）
                 bytes_received = 0
-                async for chunk in response.content.iter_any():
+                bytes_since_drain = 0
+                async for chunk in response.content.iter_chunked(65536):
                     writer.write(chunk)
-                    bytes_received += len(chunk)
-                
-                await writer.drain()
+                    n = len(chunk)
+                    bytes_received += n
+                    bytes_since_drain += n
+                    if bytes_since_drain >= 128 * 1024:
+                        await writer.drain()
+                        bytes_since_drain = 0
+                if bytes_since_drain:
+                    await writer.drain()
                 
                 await self.stats.record_bytes(len(body) if body else 0, bytes_received)
                 await self.stats.record_request(True)
@@ -775,23 +845,45 @@ class ProxyServer:
     async def _relay_tunnel(self, c_reader, c_writer, t_reader, t_writer, conn_id):
         """双向转发数据（用于CONNECT隧道）"""
         async def relay(reader, writer, direction):
+            bufsize = 65536 if direction == 'T->C' else max(4096, self.config.bufsize)
+            threshold = 128 * 1024 if direction == 'T->C' else 32 * 1024
+            sent_since_drain = 0
+            total_c2t = total_t2c = 0
             try:
                 while True:
-                    data = await reader.read(self.config.bufsize)
+                    data = await reader.read(bufsize)
                     if not data:
                         break
                     writer.write(data)
-                    await writer.drain()
-                    
+                    sent_since_drain += len(data)
+                    if sent_since_drain >= threshold:
+                        await writer.drain()
+                        sent_since_drain = 0
                     if direction == 'C->T':
-                        await self.stats.record_bytes(len(data), 0)
+                        total_c2t += len(data)
                     else:
-                        await self.stats.record_bytes(0, len(data))
-                        
+                        total_t2c += len(data)
             except Exception:
                 pass
             finally:
-                writer.close()
+                try:
+                    if sent_since_drain:
+                        await writer.drain()
+                    if hasattr(writer, "can_write_eof") and writer.can_write_eof():
+                        writer.write_eof()
+                        await writer.drain()
+                    else:
+                        writer.close()
+                except Exception:
+                    pass
+                # 聚合后再记账，减少热路径 await
+                try:
+                    if direction == 'C->T':
+                        await self.stats.record_bytes(total_c2t, 0)
+                    else:
+                        await self.stats.record_bytes(0, total_t2c)
+                except Exception:
+                    pass
         
         await asyncio.gather(
             relay(c_reader, t_writer, 'C->T'),
@@ -850,7 +942,7 @@ def is_ip_literal(host: str) -> bool:
 
 async def resolve_with_doh(hostname: str, qtype: str, doh_server: str, 
                            session: aiohttp.ClientSession, logger: ProxyLogger) -> Optional[str]:
-    """使用DoH解析域名（保留原有实现，但增加错误处理）"""
+    """使用DoH解析域名（返回单个记录）"""
     try:
         path = urlparse(doh_server).path.rstrip('/')
         if path.endswith('/resolve'):
@@ -894,6 +986,125 @@ async def resolve_with_doh(hostname: str, qtype: str, doh_server: str,
         logger.error(f"DoH resolution error for {hostname}/{qtype}: {e}")
         return None
 
+async def resolve_with_doh_multi(hostname: str, qtype: str, doh_server: str, 
+                                 session: aiohttp.ClientSession, logger: 'ProxyLogger') -> List[str]:
+    """DoH 多记录解析，返回所有 A/AAAA 记录"""
+    ips: List[str] = []
+    try:
+        path = urlparse(doh_server).path.rstrip('/')
+        if path.endswith('/resolve'):
+            # JSON API
+            type_code = 1 if qtype == 'A' else 28
+            url = f"{doh_server}?name={hostname}&type={type_code}"
+            headers = {'accept': 'application/dns-json'}
+            async with session.get(url, headers=headers, timeout=10) as response:
+                if response.status != 200:
+                    return []
+                resp_json = await response.json(content_type=None)
+                if resp_json.get('Status') == 0 and 'Answer' in resp_json:
+                    for answer in resp_json.get('Answer', []):
+                        if answer.get('type') == type_code:
+                            ip = answer.get('data')
+                            if ip and ip not in ips:
+                                ips.append(ip)
+        else:
+            # RFC8484 binary
+            query = dns_message.make_query(hostname, qtype)
+            wire_query = query.to_wire()
+            headers = {
+                'accept': 'application/dns-message',
+                'content-type': 'application/dns-message'
+            }
+            async with session.post(doh_server, headers=headers, data=wire_query, timeout=10) as response:
+                if response.status != 200:
+                    return []
+                wire_response = await response.read()
+                dns_response = dns_message.from_wire(wire_response)
+                for answer in dns_response.answer:
+                    if (qtype == 'A' and answer.rdtype == 1) or (qtype == 'AAAA' and answer.rdtype == 28):
+                        ip = answer[0].to_text()
+                        if ip and ip not in ips:
+                            ips.append(ip)
+        return ips
+    except Exception as e:
+        logger.error(f"DoH multi resolution error for {hostname}/{qtype}: {e}")
+        return []
+
+# ========== 连接与解析辅助 ==========
+async def getaddrinfo_ips(host: str, port: int) -> List[str]:
+    infos = await asyncio.get_running_loop().getaddrinfo(
+        host, port, proto=socket.IPPROTO_TCP
+    )
+    ips: List[str] = []
+    for family, _, _, _, sockaddr in infos:
+        ip = sockaddr[0]
+        if ip not in ips:
+            ips.append(ip)
+    return ips
+
+# 将 DoH 多记录与系统解析结合，供 CONNECT 并发建连使用
+async def resolve_ips_for_connect(host: str, port: int, doh_server: Optional[str],
+                                  doh_session: Optional[aiohttp.ClientSession],
+                                  logger: ProxyLogger) -> List[str]:
+    if is_ip_literal(host):
+        return [host]
+    ips: List[str] = []
+    if doh_server and doh_session:
+        v4_task = asyncio.create_task(resolve_with_doh_multi(host, 'A', doh_server, doh_session, logger))
+        v6_task = asyncio.create_task(resolve_with_doh_multi(host, 'AAAA', doh_server, doh_session, logger))
+        v4, v6 = await asyncio.gather(v4_task, v6_task, return_exceptions=True)
+        if isinstance(v4, list):
+            ips.extend(v4)
+        if isinstance(v6, list):
+            ips.extend(v6)
+    if not ips:
+        ips = await getaddrinfo_ips(host, port)
+    return ips
+
+# 并发连接多个 IP，返回第一个成功的连接，正确清理其它任务
+async def connect_first_success(ips: List[str], port: int, timeout: float):
+    loop = asyncio.get_running_loop()
+    tasks = [loop.create_task(asyncio.open_connection(ip, port)) for ip in ips]
+    winner_result = None
+    last_exc = None
+    try:
+        for fut in asyncio.as_completed(tasks, timeout=timeout):
+            try:
+                result = await fut
+                winner_result = result
+                break
+            except Exception as e:
+                last_exc = e
+                continue
+    except asyncio.TimeoutError as e:
+        last_exc = e
+    finally:
+        # 取消并收割其余任务，避免 "Task exception was never retrieved"
+        for t in tasks:
+            if not t.done():
+                t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+    if winner_result:
+        return winner_result
+    raise last_exc or OSError("All connection attempts failed")
+
+# ========== 供 ProxyServer 使用的 Happy Eyeballs 连接函数 ==========
+async def _connect_happy_eyeballs(self, host: str, port: int, timeout: float):
+    if is_ip_literal(host):
+        return await asyncio.open_connection(host, port)
+    ips = await resolve_ips_for_connect(host, port, self.config.doh_server, self.doh_session, self.logger)
+    if not ips:
+        raise OSError(f"Could not resolve {host}")
+    # 根据偏好重排：优先 IPv4 或 IPv6
+    if self.config.prefer_ipv4:
+        ips = [ip for ip in ips if ':' not in ip] + [ip for ip in ips if ':' in ip]
+    else:
+        ips = [ip for ip in ips if ':' in ip] + [ip for ip in ips if ':' not in ip]
+    return await connect_first_success(ips, port, timeout)
+
+# 动态绑定到类（减少对原结构的侵入）
+ProxyServer._connect_happy_eyeballs = _connect_happy_eyeballs
+
 # =========================
 # 主函数
 # =========================
@@ -923,6 +1134,10 @@ async def main():
     parser.add_argument('--connect-timeout', type=float, default=10.0, help="Connection timeout")
     parser.add_argument('--header-timeout', type=float, default=15.0, help="Header read timeout")
     parser.add_argument('--bufsize', type=int, default=4096, help="Buffer size")
+    # 出站连接偏好与端口复用
+    parser.add_argument('--prefer-ipv4', action='store_true', help="Prefer IPv4 for outbound connects")
+    parser.add_argument('--prefer-ipv6', action='store_true', help="Prefer IPv6 for outbound connects")
+    parser.add_argument('--no-reuse-port', action='store_true', help="Disable SO_REUSEPORT on Linux")
     
     # 功能开关
     parser.add_argument('--enable-websocket', action='store_true', help="Enable WebSocket support")
@@ -973,6 +1188,19 @@ async def main():
             log_level=args.log_level,
             verbose=args.verbose
         )
+        # 偏好开关
+        if args.prefer_ipv6:
+            config.prefer_ipv4 = False
+        elif args.prefer_ipv4:
+            config.prefer_ipv4 = True
+        # reuse_port（仅 Linux 生效）
+        if sys.platform.startswith('linux'):
+            if args.no_reuse_port:
+                config.reuse_port = False
+            else:
+                config.reuse_port = True
+        else:
+            config.reuse_port = False
     
     # 创建并启动服务器
     server = ProxyServer(config)
