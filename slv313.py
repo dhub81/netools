@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
 
 r"""
-SSH Tunnel Proxy Server - Sans-I/O Refactored v7
+SSH Tunnel Proxy Server - Sans-I/O Refactored v7 
 
 ================================================
 
 python3 d:\py\slv313.py ^
 --ssh-host x.x.x.x ^
 --ssh-port 22 ^
---pool-size 1 ^
 --no-log-connections ^
 --ssh-user user ^
 --ssh-key "~\.ssh\id_rsa" ^
 --local-port 3128 ^
 --test-url http://www.google.com ^
---local-host 0.0.0.0
+--pool-size 8 --max-sessions 4 --event-loop-shards 4 ^
+--local-host 127.0.0.1
 
 """
 
