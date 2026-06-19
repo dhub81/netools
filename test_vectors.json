@@ -1,0 +1,2190 @@
+{
+  "schema": "ssh-tunnel-proxy-spec-v1",
+  "defaults": {
+    "max_buffer": 8192,
+    "pipe_idle_timeout": 300
+  },
+  "reduce_cases": [
+    {
+      "id": "socks5_greeting_no_auth",
+      "source_tests": [
+        "TestReduceProto_Socks5Greeting"
+      ],
+      "initial_state": {
+        "phase": "INIT",
+        "proxy_mode": "Both"
+      },
+      "steps": [
+        {
+          "event": {
+            "type": "ClientData",
+            "hex": "050100"
+          },
+          "expect": {
+            "state": {
+              "phase": "SOCKS5_REQ"
+            },
+            "effects": [
+              {
+                "type": "WriteClient",
+                "hex": "0500"
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "socks5_short_bad_version_waits_for_more_data",
+      "source_tests": [
+        "TestReduceProto_Socks5BadVersion"
+      ],
+      "initial_state": {
+        "phase": "INIT",
+        "proxy_mode": "SOCKS5"
+      },
+      "steps": [
+        {
+          "event": {
+            "type": "ClientData",
+            "hex": "040100"
+          },
+          "expect": {
+            "state": {
+              "phase": "INIT",
+              "buffer_hex": "040100"
+            },
+            "effects": []
+          }
+        }
+      ]
+    },
+    {
+      "id": "socks5_connect_ipv4_acquires_pool",
+      "source_tests": [
+        "TestReduceProto_Socks5ConnectIPv4",
+        "BenchmarkReduceProtoSOCKS5ConnectIPv4"
+      ],
+      "initial_state": {
+        "phase": "SOCKS5_REQ",
+        "proxy_mode": "SOCKS5"
+      },
+      "steps": [
+        {
+          "event": {
+            "type": "ClientData",
+            "hex": "050100017f0000010050"
+          },
+          "expect": {
+            "state": {
+              "phase": "CONNECTING",
+              "target_host": "127.0.0.1",
+              "target_port": 80,
+              "session_mode": "Socks",
+              "buffer_hex": ""
+            },
+            "effects": [
+              {
+                "type": "ConnectTarget",
+                "host": "127.0.0.1",
+                "port": 80
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "socks5_connect_domain_acquires_pool",
+      "source_tests": [
+        "TestReduceProto_Socks5ConnectDomain"
+      ],
+      "initial_state": {
+        "phase": "SOCKS5_REQ",
+        "proxy_mode": "SOCKS5"
+      },
+      "steps": [
+        {
+          "event": {
+            "type": "ClientData",
+            "hex": "050100030b6578616d706c652e636f6d01bb"
+          },
+          "expect": {
+            "state": {
+              "phase": "CONNECTING",
+              "target_host": "example.com",
+              "target_port": 443,
+              "session_mode": "Socks"
+            },
+            "effects": [
+              {
+                "type": "ConnectTarget",
+                "host": "example.com",
+                "port": 443
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "socks5_connect_short_domain_acquires_pool",
+      "source_tests": [
+        "r10-M3-socks-domain-short"
+      ],
+      "initial_state": {
+        "phase": "SOCKS5_REQ",
+        "proxy_mode": "SOCKS5"
+      },
+      "steps": [
+        {
+          "event": {
+            "type": "ClientData",
+            "hex": "0501000301610050"
+          },
+          "expect": {
+            "state": {
+              "phase": "CONNECTING",
+              "target_host": "a",
+              "target_port": 80,
+              "session_mode": "Socks",
+              "buffer_hex": ""
+            },
+            "effects": [
+              {
+                "type": "ConnectTarget",
+                "host": "a",
+                "port": 80
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "socks5_connect_ipv6_uses_standard_format",
+      "source_tests": [
+        "r10-low-socks-ipv6-format"
+      ],
+      "initial_state": {
+        "phase": "SOCKS5_REQ",
+        "proxy_mode": "SOCKS5"
+      },
+      "steps": [
+        {
+          "event": {
+            "type": "ClientData",
+            "hex": "0501000420010db800000000000000000000000101bb"
+          },
+          "expect": {
+            "state": {
+              "phase": "CONNECTING",
+              "target_host": "2001:db8::1",
+              "target_port": 443,
+              "session_mode": "Socks",
+              "buffer_hex": ""
+            },
+            "effects": [
+              {
+                "type": "ConnectTarget",
+                "host": "2001:db8::1",
+                "port": 443
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "socks5_connect_pipelined_data_flushes_after_target_connected",
+      "source_tests": [
+        "r10-H2-socks-pipelined-data"
+      ],
+      "initial_state": {
+        "phase": "SOCKS5_REQ",
+        "proxy_mode": "SOCKS5"
+      },
+      "steps": [
+        {
+          "event": {
+            "type": "ClientData",
+            "hex": "050100017f000001005048454c4c4f"
+          },
+          "expect": {
+            "state": {
+              "phase": "CONNECTING",
+              "target_host": "127.0.0.1",
+              "target_port": 80,
+              "session_mode": "Socks",
+              "buffer_text": "HELLO"
+            },
+            "effects": [
+              {
+                "type": "ConnectTarget",
+                "host": "127.0.0.1",
+                "port": 80
+              }
+            ]
+          }
+        },
+        {
+          "event": {
+            "type": "TargetConnected"
+          },
+          "expect": {
+            "state": {
+              "phase": "PIPING",
+              "pipe_stage": "Flowing",
+              "buffer_hex": "",
+              "bytes_sent": 5
+            },
+            "effects": [
+              {
+                "type": "WriteClient",
+                "hex": "05000001000000000000"
+              },
+              {
+                "type": "WriteRemote",
+                "text": "HELLO"
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "socks5_udp_associate_counts_as_failure",
+      "source_tests": [
+        "r10-low-socks-udp-error-semantics"
+      ],
+      "initial_state": {
+        "phase": "SOCKS5_REQ",
+        "proxy_mode": "SOCKS5"
+      },
+      "steps": [
+        {
+          "event": {
+            "type": "ClientData",
+            "hex": "050300017f0000010050"
+          },
+          "expect": {
+            "state": {
+              "phase": "CLOSED"
+            },
+            "effects": [
+              {
+                "type": "WriteClient",
+                "hex": "05070001000000000000"
+              },
+              {
+                "type": "SessionFailed",
+                "message": "UDP ASSOCIATE not supported"
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "socks5_unsupported_command_rejected",
+      "source_tests": [
+        "TestReduceProto_Socks5UnsupportedCmd"
+      ],
+      "initial_state": {
+        "phase": "SOCKS5_REQ",
+        "proxy_mode": "SOCKS5"
+      },
+      "steps": [
+        {
+          "event": {
+            "type": "ClientData",
+            "hex": "050200017f0000010050"
+          },
+          "expect": {
+            "state": {
+              "phase": "CLOSED"
+            },
+            "effects": [
+              {
+                "type": "WriteClient",
+                "hex": "05070001000000000000"
+              },
+              {
+                "type": "SessionFailed",
+                "message": "unsupported socks5 cmd"
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "connecting_client_data_is_not_handshake_overflow",
+      "source_tests": [
+        "r12-N1-connecting-data-not-handshake-overflow"
+      ],
+      "initial_state": {
+        "phase": "CONNECTING",
+        "proxy_mode": "HTTP",
+        "session_mode": "HTTPConnect"
+      },
+      "steps": [
+        {
+          "event": {
+            "type": "ClientData",
+            "repeat_hex": "00",
+            "repeat_count": 9000
+          },
+          "expect": {
+            "state": {
+              "phase": "CONNECTING",
+              "buffer_len": 9000
+            },
+            "effects": []
+          }
+        }
+      ]
+    },
+    {
+      "id": "http_connect_large_pipelined_data_not_handshake_overflow",
+      "source_tests": [
+        "r12-N1-http-connect-large-pipelined-data"
+      ],
+      "initial_state": {
+        "phase": "HTTP_REQ",
+        "proxy_mode": "HTTP",
+        "buffer_text": "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n"
+      },
+      "steps": [
+        {
+          "event": {
+            "type": "ClientData",
+            "repeat_hex": "41",
+            "repeat_count": 9000
+          },
+          "expect": {
+            "state": {
+              "phase": "CONNECTING",
+              "target_host": "example.com",
+              "target_port": 443,
+              "session_mode": "HTTPConnect",
+              "buffer_len": 9000
+            },
+            "effects": [
+              {
+                "type": "ConnectTarget",
+                "host": "example.com",
+                "port": 443
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "http_proxy_large_body_not_handshake_overflow",
+      "source_tests": [
+        "r12-N1-http-proxy-large-body"
+      ],
+      "initial_state": {
+        "phase": "HTTP_REQ",
+        "proxy_mode": "HTTP",
+        "buffer_text": "POST /upload HTTP/1.1\r\nHost: example.com\r\nContent-Length: 9000\r\n\r\n"
+      },
+      "steps": [
+        {
+          "event": {
+            "type": "ClientData",
+            "repeat_hex": "41",
+            "repeat_count": 9000
+          },
+          "expect": {
+            "state": {
+              "phase": "CONNECTING",
+              "target_host": "example.com",
+              "target_port": 80,
+              "session_mode": "HTTPProxy",
+              "buffer_len": 9000
+            },
+            "effects": [
+              {
+                "type": "ConnectTarget",
+                "host": "example.com",
+                "port": 80
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "handshake_buffer_overflow_closes",
+      "source_tests": [
+        "TestReduceProto_BufferOverflow"
+      ],
+      "initial_state": {
+        "phase": "HTTP_REQ",
+        "proxy_mode": "HTTP",
+        "buffer_text": "GET / HTTP/1.1\r\nX-Fill: "
+      },
+      "steps": [
+        {
+          "event": {
+            "type": "ClientData",
+            "repeat_hex": "41",
+            "repeat_count": 9000
+          },
+          "expect": {
+            "state": {
+              "phase": "CLOSED"
+            },
+            "effects": [
+              {
+                "type": "SessionFailed",
+                "message": "handshake buffer overflow"
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "handshake_timeout_init_closes",
+      "source_tests": [
+        "TestReduceProto_HandshakeTimeoutClosesSession"
+      ],
+      "initial_state": {
+        "phase": "INIT",
+        "proxy_mode": "Both"
+      },
+      "steps": [
+        {
+          "event": {
+            "type": "HandshakeTimeout",
+            "elapsed": 0
+          },
+          "expect": {
+            "state": {
+              "phase": "CLOSED"
+            },
+            "effects": [
+              {
+                "type": "SessionFailed",
+                "message": "handshake timeout"
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "handshake_timeout_socks_auth_closes",
+      "source_tests": [
+        "TestReduceProto_HandshakeTimeoutClosesSession"
+      ],
+      "initial_state": {
+        "phase": "SOCKS5_AUTH",
+        "proxy_mode": "Both"
+      },
+      "steps": [
+        {
+          "event": {
+            "type": "HandshakeTimeout",
+            "elapsed": 0
+          },
+          "expect": {
+            "state": {
+              "phase": "CLOSED"
+            },
+            "effects": [
+              {
+                "type": "SessionFailed",
+                "message": "handshake timeout"
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "handshake_timeout_socks_req_closes",
+      "source_tests": [
+        "TestReduceProto_HandshakeTimeoutClosesSession"
+      ],
+      "initial_state": {
+        "phase": "SOCKS5_REQ",
+        "proxy_mode": "Both"
+      },
+      "steps": [
+        {
+          "event": {
+            "type": "HandshakeTimeout",
+            "elapsed": 0
+          },
+          "expect": {
+            "state": {
+              "phase": "CLOSED"
+            },
+            "effects": [
+              {
+                "type": "SessionFailed",
+                "message": "handshake timeout"
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "handshake_timeout_http_req_closes",
+      "source_tests": [
+        "TestReduceProto_HandshakeTimeoutClosesSession"
+      ],
+      "initial_state": {
+        "phase": "HTTP_REQ",
+        "proxy_mode": "Both"
+      },
+      "steps": [
+        {
+          "event": {
+            "type": "HandshakeTimeout",
+            "elapsed": 0
+          },
+          "expect": {
+            "state": {
+              "phase": "CLOSED"
+            },
+            "effects": [
+              {
+                "type": "SessionFailed",
+                "message": "handshake timeout"
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "pipe_client_data_forwards_to_remote",
+      "source_tests": [
+        "TestReducePipe_ClientDataForwardsToRemote",
+        "BenchmarkReducePipeClientData"
+      ],
+      "initial_state": {
+        "phase": "PIPING",
+        "pipe_stage": "Flowing",
+        "session_mode": "Socks"
+      },
+      "steps": [
+        {
+          "event": {
+            "type": "PipeDataClient",
+            "text": "hello",
+            "length": 5
+          },
+          "expect": {
+            "state": {
+              "pipe_stage": "Flowing",
+              "bytes_sent": 5
+            },
+            "effects": [
+              {
+                "type": "WriteRemote",
+                "text": "hello"
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "pipe_remote_data_forwards_to_client",
+      "source_tests": [
+        "TestReducePipe_RemoteDataForwardsToClient"
+      ],
+      "initial_state": {
+        "phase": "PIPING",
+        "pipe_stage": "Flowing",
+        "session_mode": "Socks"
+      },
+      "steps": [
+        {
+          "event": {
+            "type": "PipeDataRemote",
+            "text": "world",
+            "length": 5
+          },
+          "expect": {
+            "state": {
+              "bytes_received": 5
+            },
+            "effects": [
+              {
+                "type": "WriteClient",
+                "text": "world"
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "pipe_client_eof_half_closes_remote_write",
+      "source_tests": [
+        "TestReducePipe_ClientEOFHClosesRemoteWrite"
+      ],
+      "initial_state": {
+        "phase": "PIPING",
+        "pipe_stage": "Flowing"
+      },
+      "steps": [
+        {
+          "event": {
+            "type": "PipeEOF",
+            "source": "Client"
+          },
+          "expect": {
+            "state": {
+              "pipe_stage": "HalfClosedClient"
+            },
+            "effects": [
+              {
+                "type": "PipeWriteEOF",
+                "endpoint": "Remote"
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "pipe_remote_eof_half_closes_client_write",
+      "source_tests": [
+        "TestReducePipe_RemoteEOFHClosesClientWrite"
+      ],
+      "initial_state": {
+        "phase": "PIPING",
+        "pipe_stage": "Flowing"
+      },
+      "steps": [
+        {
+          "event": {
+            "type": "PipeEOF",
+            "source": "Remote"
+          },
+          "expect": {
+            "state": {
+              "pipe_stage": "HalfClosedRemote"
+            },
+            "effects": [
+              {
+                "type": "PipeWriteEOF",
+                "endpoint": "Client"
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "pipe_both_eof_client_first_closes_session",
+      "source_tests": [
+        "TestReducePipe_BothEOFClosesSession"
+      ],
+      "initial_state": {
+        "phase": "PIPING",
+        "pipe_stage": "Flowing"
+      },
+      "steps": [
+        {
+          "event": {
+            "type": "PipeEOF",
+            "source": "Client"
+          },
+          "expect": {
+            "state": {
+              "pipe_stage": "HalfClosedClient"
+            },
+            "effects": [
+              {
+                "type": "PipeWriteEOF",
+                "endpoint": "Remote"
+              }
+            ]
+          }
+        },
+        {
+          "event": {
+            "type": "PipeEOF",
+            "source": "Remote"
+          },
+          "expect": {
+            "state": {
+              "phase": "CLOSED",
+              "pipe_stage": "Closed"
+            },
+            "effects": [
+              {
+                "type": "SessionDone",
+                "message": "both eof"
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "pipe_both_eof_remote_first_closes_session",
+      "source_tests": [
+        "TestReducePipe_BothEOF_RemoteFirst"
+      ],
+      "initial_state": {
+        "phase": "PIPING",
+        "pipe_stage": "Flowing"
+      },
+      "steps": [
+        {
+          "event": {
+            "type": "PipeEOF",
+            "source": "Remote"
+          },
+          "expect": {
+            "state": {
+              "pipe_stage": "HalfClosedRemote"
+            },
+            "effects": [
+              {
+                "type": "PipeWriteEOF",
+                "endpoint": "Client"
+              }
+            ]
+          }
+        },
+        {
+          "event": {
+            "type": "PipeEOF",
+            "source": "Client"
+          },
+          "expect": {
+            "state": {
+              "phase": "CLOSED",
+              "pipe_stage": "Closed"
+            },
+            "effects": [
+              {
+                "type": "SessionDone",
+                "message": "both eof"
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "pipe_client_data_blocked_after_client_half_close",
+      "source_tests": [
+        "TestReducePipe_DataBlockedAfterHalfClose"
+      ],
+      "initial_state": {
+        "phase": "PIPING",
+        "pipe_stage": "HalfClosedClient"
+      },
+      "steps": [
+        {
+          "event": {
+            "type": "PipeDataClient",
+            "text": "should be ignored",
+            "length": 17
+          },
+          "expect": {
+            "state": {
+              "bytes_sent": 0
+            },
+            "effects": []
+          }
+        }
+      ]
+    },
+    {
+      "id": "pipe_remote_data_blocked_after_remote_half_close",
+      "source_tests": [
+        "TestReducePipe_DataBlockedAfterRemoteHalfClose"
+      ],
+      "initial_state": {
+        "phase": "PIPING",
+        "pipe_stage": "HalfClosedRemote"
+      },
+      "steps": [
+        {
+          "event": {
+            "type": "PipeDataRemote",
+            "text": "blocked",
+            "length": 6
+          },
+          "expect": {
+            "state": {
+              "bytes_received": 0
+            },
+            "effects": []
+          }
+        }
+      ]
+    },
+    {
+      "id": "pipe_idle_timeout_fails_session",
+      "source_tests": [
+        "TestReducePipe_IdleTimeout"
+      ],
+      "initial_state": {
+        "phase": "PIPING",
+        "pipe_stage": "Flowing"
+      },
+      "steps": [
+        {
+          "event": {
+            "type": "PipeIdleTimeout",
+            "elapsed": 300
+          },
+          "expect": {
+            "state": {
+              "phase": "CLOSED",
+              "pipe_stage": "Closed"
+            },
+            "effects": [
+              {
+                "type": "SessionFailed",
+                "message": "idle timeout"
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "pipe_remote_error_closes_without_marking_slot_failure",
+      "source_tests": [
+        "TestReducePipe_PipeErrorFromRemoteDoesNotMarkSlotFailure"
+      ],
+      "initial_state": {
+        "phase": "PIPING",
+        "pipe_stage": "Flowing",
+        "pool_slot_idx": 2,
+        "pool_slot_id": "slot-2"
+      },
+      "steps": [
+        {
+          "event": {
+            "type": "PipeError",
+            "source": "Remote",
+            "error_msg": "connection reset"
+          },
+          "expect": {
+            "state": {
+              "phase": "CLOSED",
+              "pipe_stage": "Closed"
+            },
+            "effects": [
+              {
+                "type": "ClearDeadline",
+                "kind": "idle"
+              },
+              {
+                "type": "SessionFailed",
+                "message": "pipe error"
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "pipe_client_error_does_not_mark_slot",
+      "source_tests": [
+        "TestReducePipe_PipeErrorFromClientDoesNotMarkSlot"
+      ],
+      "initial_state": {
+        "phase": "PIPING",
+        "pipe_stage": "Flowing"
+      },
+      "steps": [
+        {
+          "event": {
+            "type": "PipeError",
+            "source": "Client",
+            "error_msg": "client gone"
+          },
+          "expect": {
+            "state": {
+              "phase": "CLOSED",
+              "pipe_stage": "Closed"
+            },
+            "effects": [
+              {
+                "type": "SessionFailed",
+                "message": "pipe error"
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "pipe_remote_send_failed_closes_without_marking_slot_failure",
+      "source_tests": [
+        "TestReducePipe_SendFailedRemoteDoesNotMarkSlotFailure"
+      ],
+      "initial_state": {
+        "phase": "PIPING",
+        "pipe_stage": "Flowing",
+        "pool_slot_idx": 2,
+        "pool_slot_id": "slot-2"
+      },
+      "steps": [
+        {
+          "event": {
+            "type": "SendFailed",
+            "where": "remote write"
+          },
+          "expect": {
+            "state": {
+              "phase": "CLOSED",
+              "pipe_stage": "Closed"
+            },
+            "effects": [
+              {
+                "type": "ClearDeadline",
+                "kind": "idle"
+              },
+              {
+                "type": "SessionFailed",
+                "message": "send failed"
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "http_malformed_version_fails",
+      "source_tests": [
+        "TestReduceHTTP_MalformedVersionString"
+      ],
+      "initial_state": {
+        "phase": "HTTP_REQ",
+        "proxy_mode": "HTTP"
+      },
+      "steps": [
+        {
+          "event": {
+            "type": "ClientData",
+            "text": "GET /path HTTP/1.1 garbage extra\r\nHost: example.com\r\n\r\n"
+          },
+          "expect": {
+            "state": {
+              "phase": "CLOSED"
+            },
+            "effects": [
+              {
+                "type": "SessionFailed",
+                "message": "unsupported http version"
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "http_connect_missing_port_fails",
+      "source_tests": [
+        "r10-M3-http-connect-missing-port"
+      ],
+      "initial_state": {
+        "phase": "HTTP_REQ",
+        "proxy_mode": "HTTP"
+      },
+      "steps": [
+        {
+          "event": {
+            "type": "ClientData",
+            "text": "CONNECT example.com HTTP/1.1\r\nHost: example.com\r\n\r\n"
+          },
+          "expect": {
+            "state": {
+              "phase": "CLOSED"
+            },
+            "effects": [
+              {
+                "type": "SessionFailed",
+                "message": "malformed CONNECT target"
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "http_relative_url_missing_host_fails",
+      "source_tests": [
+        "r10-M3-http-relative-missing-host"
+      ],
+      "initial_state": {
+        "phase": "HTTP_REQ",
+        "proxy_mode": "HTTP"
+      },
+      "steps": [
+        {
+          "event": {
+            "type": "ClientData",
+            "text": "GET /path HTTP/1.1\r\nUser-Agent: test\r\n\r\n"
+          },
+          "expect": {
+            "state": {
+              "phase": "CLOSED"
+            },
+            "effects": [
+              {
+                "type": "SessionFailed",
+                "message": "missing Host header"
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "http_connect_pipelined_data_flushes_after_target_connected",
+      "source_tests": [
+        "r10-H2-http-connect-pipelined-data"
+      ],
+      "initial_state": {
+        "phase": "HTTP_REQ",
+        "proxy_mode": "HTTP"
+      },
+      "steps": [
+        {
+          "event": {
+            "type": "ClientData",
+            "text": "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com\r\n\r\nHELLO"
+          },
+          "expect": {
+            "state": {
+              "phase": "CONNECTING",
+              "target_host": "example.com",
+              "target_port": 443,
+              "session_mode": "HTTPConnect",
+              "buffer_text": "HELLO"
+            },
+            "effects": [
+              {
+                "type": "ConnectTarget",
+                "host": "example.com",
+                "port": 443
+              }
+            ]
+          }
+        },
+        {
+          "event": {
+            "type": "TargetConnected"
+          },
+          "expect": {
+            "state": {
+              "phase": "PIPING",
+              "pipe_stage": "Flowing",
+              "buffer_hex": "",
+              "bytes_sent": 5
+            },
+            "effects": [
+              {
+                "type": "WriteClient",
+                "text": "HTTP/1.1 200 Connection Established\r\n\r\n"
+              },
+              {
+                "type": "WriteRemote",
+                "text": "HELLO"
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "http_proxy_rewrites_absolute_url_and_strips_proxy_headers",
+      "source_tests": [
+        "TestReduceHTTPProxy_RewritesAbsoluteURLAndStripsProxyHeaders",
+        "BenchmarkHTTPRewriteAbsoluteURL"
+      ],
+      "initial_state": {
+        "phase": "HTTP_REQ",
+        "proxy_mode": "HTTP"
+      },
+      "steps": [
+        {
+          "event": {
+            "type": "ClientData",
+            "text": "GET http://example.com:8080/path?q=1 HTTP/1.1\r\nHost: old.example\r\nProxy-Connection: keep-alive\r\nUser-Agent: test\r\n\r\nbody"
+          },
+          "expect": {
+            "state": {
+              "phase": "CONNECTING",
+              "session_mode": "HTTPProxy",
+              "target_host": "example.com",
+              "target_port": 8080,
+              "http_rewritten_headers_text": "GET /path?q=1 HTTP/1.1\r\nHost: example.com:8080\r\nUser-Agent: test\r\n\r\n",
+              "buffer_text": "body"
+            },
+            "effects": [
+              {
+                "type": "ConnectTarget",
+                "host": "example.com",
+                "port": 8080
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "http_proxy_open_flushes_rewritten_request_and_body",
+      "source_tests": [
+        "BenchmarkHTTPProxyConnectAndBodyFlushEffect"
+      ],
+      "initial_state": {
+        "phase": "HTTP_REQ",
+        "proxy_mode": "HTTP"
+      },
+      "steps": [
+        {
+          "event": {
+            "type": "ClientData",
+            "text": "GET http://example.com:8080/path?q=1 HTTP/1.1\r\nHost: old\r\nProxy-Connection: keep-alive\r\nUser-Agent: bench\r\n\r\nbody"
+          },
+          "expect": {
+            "state": {
+              "phase": "CONNECTING",
+              "session_mode": "HTTPProxy",
+              "target_host": "example.com",
+              "target_port": 8080,
+              "buffer_text": "body"
+            },
+            "effects": [
+              {
+                "type": "ConnectTarget",
+                "host": "example.com",
+                "port": 8080
+              }
+            ]
+          }
+        },
+        {
+          "event": {
+            "type": "TargetConnected"
+          },
+          "expect": {
+            "state": {
+              "phase": "PIPING",
+              "pipe_stage": "Flowing",
+              "bytes_sent": 4
+            },
+            "effects": [
+              {
+                "type": "WriteRemote",
+                "text": "GET /path?q=1 HTTP/1.1\r\nHost: example.com:8080\r\nUser-Agent: bench\r\n\r\nbody"
+              }
+            ]
+          }
+        }
+      ]
+    }
+  ],
+  "helper_cases": [
+    {
+      "id": "socks5_reply_success",
+      "source_tests": [
+        "TestSocks5Reply"
+      ],
+      "helper": "socks5Reply",
+      "input": {
+        "rep": 0
+      },
+      "expect": "05000001000000000000"
+    },
+    {
+      "id": "socks5_reply_refused",
+      "source_tests": [
+        "TestSocks5Reply"
+      ],
+      "helper": "socks5Reply",
+      "input": {
+        "rep": 5
+      },
+      "expect": "05050001000000000000"
+    },
+    {
+      "id": "fail_reason_refused_maps_to_socks_refused",
+      "source_tests": [
+        "TestMapFailReason"
+      ],
+      "helper": "mapFailReasonToSocksRep",
+      "input": {
+        "reason": "Refused"
+      },
+      "expect": 5
+    },
+    {
+      "id": "fail_reason_target_refused_maps_to_socks_refused",
+      "source_tests": [
+        "TestMapFailReason"
+      ],
+      "helper": "mapFailReasonToSocksRep",
+      "input": {
+        "reason": "TargetRefused"
+      },
+      "expect": 5
+    },
+    {
+      "id": "fail_reason_unreachable_maps_to_socks_host_unreachable",
+      "source_tests": [
+        "TestMapFailReason"
+      ],
+      "helper": "mapFailReasonToSocksRep",
+      "input": {
+        "reason": "Unreachable"
+      },
+      "expect": 4
+    },
+    {
+      "id": "fail_reason_dns_maps_to_socks_host_unreachable",
+      "source_tests": [
+        "TestMapFailReason"
+      ],
+      "helper": "mapFailReasonToSocksRep",
+      "input": {
+        "reason": "DNSError"
+      },
+      "expect": 4
+    },
+    {
+      "id": "fail_reason_timeout_maps_to_socks_host_unreachable",
+      "source_tests": [
+        "TestMapFailReason"
+      ],
+      "helper": "mapFailReasonToSocksRep",
+      "input": {
+        "reason": "Timeout"
+      },
+      "expect": 4
+    },
+    {
+      "id": "fail_reason_other_maps_to_general_failure",
+      "source_tests": [
+        "TestMapFailReason"
+      ],
+      "helper": "mapFailReasonToSocksRep",
+      "input": {
+        "reason": "Other"
+      },
+      "expect": 1
+    },
+    {
+      "id": "looks_like_http_get",
+      "source_tests": [
+        "TestLooksLikeHTTP",
+        "BenchmarkLooksLikeHTTP"
+      ],
+      "helper": "looksLikeHTTP",
+      "input": {
+        "text": "GET / HTTP/1.1\r\n"
+      },
+      "expect": true
+    },
+    {
+      "id": "looks_like_http_post",
+      "source_tests": [
+        "TestLooksLikeHTTP"
+      ],
+      "helper": "looksLikeHTTP",
+      "input": {
+        "text": "POST /api HTTP/1.1\r\n"
+      },
+      "expect": true
+    },
+    {
+      "id": "looks_like_http_connect",
+      "source_tests": [
+        "TestLooksLikeHTTP"
+      ],
+      "helper": "looksLikeHTTP",
+      "input": {
+        "text": "CONNECT example.com:443 HTTP/1.1\r\n"
+      },
+      "expect": true
+    },
+    {
+      "id": "looks_like_http_rejects_socks5",
+      "source_tests": [
+        "TestLooksLikeHTTP"
+      ],
+      "helper": "looksLikeHTTP",
+      "input": {
+        "text": "\u0005\u0001\u0000"
+      },
+      "expect": false
+    },
+    {
+      "id": "looks_like_http_rejects_empty",
+      "source_tests": [
+        "TestLooksLikeHTTP"
+      ],
+      "helper": "looksLikeHTTP",
+      "input": {
+        "text": ""
+      },
+      "expect": false
+    },
+    {
+      "id": "looks_like_http_rejects_unknown_method",
+      "source_tests": [
+        "TestLooksLikeHTTP"
+      ],
+      "helper": "looksLikeHTTP",
+      "input": {
+        "text": "HELLO / HTTP/1.1\r\n"
+      },
+      "expect": false
+    },
+    {
+      "id": "find_crlfcrlf_with_headers",
+      "source_tests": [
+        "TestFindCRLFCRLF"
+      ],
+      "helper": "findCRLFCRLF",
+      "input": {
+        "text": "GET / HTTP/1.1\r\nHost: x\r\n\r\nbody"
+      },
+      "expect": 23
+    },
+    {
+      "id": "find_crlfcrlf_empty_header_block",
+      "source_tests": [
+        "TestFindCRLFCRLF"
+      ],
+      "helper": "findCRLFCRLF",
+      "input": {
+        "text": "GET / HTTP/1.1\r\n\r\nbody"
+      },
+      "expect": 14
+    },
+    {
+      "id": "find_crlfcrlf_missing",
+      "source_tests": [
+        "TestFindCRLFCRLF"
+      ],
+      "helper": "findCRLFCRLF",
+      "input": {
+        "text": "no double crlf"
+      },
+      "expect": -1
+    },
+    {
+      "id": "parse_http_connect_target_explicit_port",
+      "source_tests": [
+        "TestParseHTTPConnectTarget"
+      ],
+      "helper": "parseHTTPConnectTarget",
+      "input": {
+        "target": "example.com:443"
+      },
+      "expect": {
+        "host": "example.com",
+        "port": 443
+      }
+    },
+    {
+      "id": "parse_http_connect_target_default_port",
+      "source_tests": [
+        "TestParseHTTPConnectTarget"
+      ],
+      "helper": "parseHTTPConnectTarget",
+      "input": {
+        "target": "example.com"
+      },
+      "expect": {
+        "host": "example.com",
+        "port": 443
+      }
+    },
+    {
+      "id": "parse_http_connect_target_ipv4_port",
+      "source_tests": [
+        "TestParseHTTPConnectTarget"
+      ],
+      "helper": "parseHTTPConnectTarget",
+      "input": {
+        "target": "1.2.3.4:8080"
+      },
+      "expect": {
+        "host": "1.2.3.4",
+        "port": 8080
+      }
+    },
+    {
+      "id": "split_lines_basic_http_head",
+      "source_tests": [
+        "TestSplitLines"
+      ],
+      "helper": "splitLines",
+      "input": {
+        "text": "GET / HTTP/1.1\r\nHost: x\r\n\r\n"
+      },
+      "expect": [
+        "GET / HTTP/1.1",
+        "Host: x",
+        ""
+      ]
+    },
+    {
+      "id": "parse_host_header_explicit_port",
+      "source_tests": [
+        "TestParseHostHeader"
+      ],
+      "helper": "parseHostHeader",
+      "input": {
+        "host_header": "example.com:8080",
+        "default_port": 80
+      },
+      "expect": {
+        "host": "example.com",
+        "port": 8080
+      }
+    },
+    {
+      "id": "parse_host_header_default_port",
+      "source_tests": [
+        "TestParseHostHeader"
+      ],
+      "helper": "parseHostHeader",
+      "input": {
+        "host_header": "example.com",
+        "default_port": 80
+      },
+      "expect": {
+        "host": "example.com",
+        "port": 80
+      }
+    },
+    {
+      "id": "format_host_header_omits_default_http_port",
+      "source_tests": [
+        "TestFormatHostHeader"
+      ],
+      "helper": "formatHostHeader",
+      "input": {
+        "host": "example.com",
+        "port": 80,
+        "scheme": "http"
+      },
+      "expect": "example.com"
+    },
+    {
+      "id": "format_host_header_keeps_non_default_http_port",
+      "source_tests": [
+        "TestFormatHostHeader"
+      ],
+      "helper": "formatHostHeader",
+      "input": {
+        "host": "example.com",
+        "port": 8080,
+        "scheme": "http"
+      },
+      "expect": "example.com:8080"
+    },
+    {
+      "id": "format_host_header_omits_default_https_port",
+      "source_tests": [
+        "TestFormatHostHeader"
+      ],
+      "helper": "formatHostHeader",
+      "input": {
+        "host": "example.com",
+        "port": 443,
+        "scheme": "https"
+      },
+      "expect": "example.com"
+    },
+    {
+      "id": "format_host_header_brackets_ipv6_default_https",
+      "source_tests": [
+        "TestFormatHostHeader"
+      ],
+      "helper": "formatHostHeader",
+      "input": {
+        "host": "::1",
+        "port": 443,
+        "scheme": "https"
+      },
+      "expect": "[::1]"
+    },
+    {
+      "id": "valid_http_method_get",
+      "source_tests": [
+        "TestIsValidHTTPMethod"
+      ],
+      "helper": "isValidHTTPMethod",
+      "input": {
+        "method": "GET"
+      },
+      "expect": true
+    },
+    {
+      "id": "valid_http_method_connect",
+      "source_tests": [
+        "TestIsValidHTTPMethod"
+      ],
+      "helper": "isValidHTTPMethod",
+      "input": {
+        "method": "CONNECT"
+      },
+      "expect": true
+    },
+    {
+      "id": "invalid_http_method_bogus",
+      "source_tests": [
+        "TestIsValidHTTPMethod"
+      ],
+      "helper": "isValidHTTPMethod",
+      "input": {
+        "method": "BOGUS"
+      },
+      "expect": false
+    },
+    {
+      "id": "valid_http_version_11",
+      "source_tests": [
+        "TestReduceHTTP_VersionValidation"
+      ],
+      "helper": "isValidHTTPVersionBytes",
+      "input": {
+        "version": "HTTP/1.1"
+      },
+      "expect": true
+    },
+    {
+      "id": "valid_http_version_10",
+      "source_tests": [
+        "TestReduceHTTP_VersionValidation"
+      ],
+      "helper": "isValidHTTPVersionBytes",
+      "input": {
+        "version": "HTTP/1.0"
+      },
+      "expect": true
+    },
+    {
+      "id": "invalid_http_version_no_prefix",
+      "source_tests": [
+        "TestReduceHTTP_VersionValidation"
+      ],
+      "helper": "isValidHTTPVersionBytes",
+      "input": {
+        "version": "1.1"
+      },
+      "expect": false
+    },
+    {
+      "id": "invalid_http_version_garbage",
+      "source_tests": [
+        "TestReduceHTTP_VersionValidation"
+      ],
+      "helper": "isValidHTTPVersionBytes",
+      "input": {
+        "version": "HTTTP/1.1"
+      },
+      "expect": false
+    },
+    {
+      "id": "invalid_http_version_trailing_data",
+      "source_tests": [
+        "TestReduceHTTP_VersionValidation"
+      ],
+      "helper": "isValidHTTPVersionBytes",
+      "input": {
+        "version": "HTTP/1.1 extra"
+      },
+      "expect": false
+    },
+    {
+      "id": "host_header_match_title_case",
+      "source_tests": [
+        "TestHTTPHeaderParsing_CaseInsensitive"
+      ],
+      "helper": "bytesHasPrefixFold",
+      "input": {
+        "line": "Host: example.com\r\n",
+        "prefix": "host:"
+      },
+      "expect": true
+    },
+    {
+      "id": "host_header_match_lower_case",
+      "source_tests": [
+        "TestHTTPHeaderParsing_CaseInsensitive"
+      ],
+      "helper": "bytesHasPrefixFold",
+      "input": {
+        "line": "host: example.com\r\n",
+        "prefix": "host:"
+      },
+      "expect": true
+    },
+    {
+      "id": "host_header_match_upper_case",
+      "source_tests": [
+        "TestHTTPHeaderParsing_CaseInsensitive"
+      ],
+      "helper": "bytesHasPrefixFold",
+      "input": {
+        "line": "HOST: example.com\r\n",
+        "prefix": "host:"
+      },
+      "expect": true
+    },
+    {
+      "id": "host_header_match_mixed_case",
+      "source_tests": [
+        "TestHTTPHeaderParsing_CaseInsensitive"
+      ],
+      "helper": "bytesHasPrefixFold",
+      "input": {
+        "line": "HoSt: example.com\r\n",
+        "prefix": "host:"
+      },
+      "expect": true
+    },
+    {
+      "id": "format_ipv4_host_dotted_quad",
+      "source_tests": [
+        "BenchmarkFormatIPv4Host"
+      ],
+      "helper": "formatIPv4Host",
+      "input": {
+        "hex": "7f000001"
+      },
+      "expect": "127.0.0.1"
+    },
+    {
+      "id": "format_ipv6_host_rfc5952_zero_compression",
+      "source_tests": [
+        "r13-proxy-core-no-std-net"
+      ],
+      "helper": "formatIPv6Host",
+      "input": {
+        "hex": "20010db8000000000000000000000001"
+      },
+      "expect": "2001:db8::1"
+    }
+  ],
+  "pool_cases": [
+    {
+      "id": "pool_selects_least_loaded_healthy_connected_slot",
+      "source_tests": [
+        "TestComputeBestSlot_SelectsLeastLoaded"
+      ],
+      "cooldown_ns": 0,
+      "max_usage": 10,
+      "views": [
+        {
+          "index": 0,
+          "healthy": true,
+          "is_connected": true,
+          "usage": 5
+        },
+        {
+          "index": 1,
+          "healthy": true,
+          "is_connected": true,
+          "usage": 2
+        },
+        {
+          "index": 2,
+          "healthy": true,
+          "is_connected": true,
+          "usage": 8
+        }
+      ],
+      "expected_index": 1
+    },
+    {
+      "id": "pool_all_slots_at_limit_returns_none",
+      "source_tests": [
+        "TestComputeBestSlot_AllSlotsAtLimitReturnsNone"
+      ],
+      "cooldown_ns": 0,
+      "max_usage": 10,
+      "views": [
+        {
+          "index": 0,
+          "healthy": true,
+          "is_connected": true,
+          "usage": 10
+        },
+        {
+          "index": 1,
+          "healthy": true,
+          "is_connected": true,
+          "usage": 10
+        }
+      ],
+      "expected_index": null
+    },
+    {
+      "id": "pool_over_limit_slots_are_not_selected",
+      "source_tests": [
+        "TestComputeBestSlot_OverLimitSlotsNotSelected"
+      ],
+      "cooldown_ns": 0,
+      "max_usage": 10,
+      "views": [
+        {
+          "index": 0,
+          "healthy": true,
+          "is_connected": true,
+          "usage": 12
+        },
+        {
+          "index": 1,
+          "healthy": true,
+          "is_connected": true,
+          "usage": 11
+        }
+      ],
+      "expected_index": null
+    },
+    {
+      "id": "pool_skips_unhealthy_slots",
+      "source_tests": [
+        "TestComputeBestSlot_SkipsUnhealthy"
+      ],
+      "cooldown_ns": 0,
+      "max_usage": 10,
+      "views": [
+        {
+          "index": 0,
+          "healthy": false,
+          "is_connected": true,
+          "usage": 0
+        },
+        {
+          "index": 1,
+          "healthy": true,
+          "is_connected": true,
+          "usage": 5
+        }
+      ],
+      "expected_index": 1
+    },
+    {
+      "id": "pool_cooldown_blocks_recently_failing_slot",
+      "source_tests": [
+        "TestComputeBestSlot_CooldownBlocksFailingSlot"
+      ],
+      "cooldown_ns": 1,
+      "max_usage": 10,
+      "views": [
+        {
+          "index": 0,
+          "healthy": true,
+          "is_connected": true,
+          "consecutive_failures": 1,
+          "last_failure_age_ns": 0,
+          "usage": 0
+        },
+        {
+          "index": 1,
+          "healthy": true,
+          "is_connected": true,
+          "usage": 5
+        }
+      ],
+      "expected_index": 1
+    }
+  ],
+  "pool_reconnect_cases": [
+    {
+      "id": "open_channel_failure_is_reported_without_state_change",
+      "source_tests": [
+        "TestSSHPoolReconnect_OpenChannelFailureReportsOnly"
+      ],
+      "initial": {
+        "state": "NoHandle",
+        "slot_id": "slot-0"
+      },
+      "action": "open_channel",
+      "expect": {
+        "healthy": false,
+        "connected": false,
+        "error_contains": "slot not connected"
+      }
+    },
+    {
+      "id": "open_channel_rejects_stale_slot_id",
+      "source_tests": [
+        "TestSSHPoolOpenChannel_RejectsStaleSlotID"
+      ],
+      "initial": {
+        "state": "NoHandle",
+        "slot_id": "slot-0"
+      },
+      "action": "open_channel_stale_slot_id",
+      "expect": {
+        "healthy": false,
+        "connected": false,
+        "error_contains": "pool slot id changed"
+      }
+    }
+  ],
+  "error_policy_cases": [
+    {
+      "id": "ssh_channel_timeout_is_soft_pool_failure",
+      "input": {
+        "type": "SshChannel",
+        "message": "direct-tcpip: channel open timeout"
+      },
+      "expect": {
+        "class": "PoolSoft"
+      }
+    },
+    {
+      "id": "ssh_channel_send_error_is_soft_pool_failure",
+      "input": {
+        "type": "SshChannel",
+        "message": "direct-tcpip: Channel send error"
+      },
+      "expect": {
+        "class": "PoolSoft"
+      }
+    },
+    {
+      "id": "slot_id_changed_is_pool_failure",
+      "input": {
+        "type": "SshChannel",
+        "message": "direct-tcpip: pool slot id changed"
+      },
+      "expect": {
+        "class": "Pool"
+      }
+    },
+    {
+      "id": "pool_resource_is_pool_failure",
+      "input": {
+        "type": "PoolResource",
+        "message": "slot handle unavailable"
+      },
+      "expect": {
+        "class": "Pool"
+      }
+    },
+    {
+      "id": "ssh_channel_timeout_op_is_soft_pool_failure",
+      "input": {
+        "type": "Timeout",
+        "op": "SshChannelOpen",
+        "message": "channel open timeout"
+      },
+      "expect": {
+        "class": "PoolSoft"
+      }
+    },
+    {
+      "id": "connect_failed_is_target_refused",
+      "input": {
+        "type": "SshChannel",
+        "message": "direct-tcpip: Failed to open channel (ConnectFailed)"
+      },
+      "expect": {
+        "class": "Target",
+        "reason": "TargetRefused"
+      }
+    },
+    {
+      "id": "no_route_is_target_refused",
+      "input": {
+        "type": "SshChannel",
+        "message": "direct-tcpip: no route to host"
+      },
+      "expect": {
+        "class": "Target",
+        "reason": "TargetRefused"
+      }
+    },
+    {
+      "id": "direct_connection_refused_is_target_refused",
+      "input": {
+        "type": "Os",
+        "kind": "ConnectionRefused",
+        "message": "refused"
+      },
+      "expect": {
+        "class": "Target",
+        "reason": "Refused"
+      }
+    },
+    {
+      "id": "direct_connection_reset_is_target_unreachable",
+      "input": {
+        "type": "Os",
+        "kind": "ConnectionReset",
+        "message": "reset"
+      },
+      "expect": {
+        "class": "Target",
+        "reason": "Unreachable"
+      }
+    },
+    {
+      "id": "direct_os_timeout_is_target_timeout",
+      "input": {
+        "type": "Os",
+        "kind": "TimedOut",
+        "message": "timeout"
+      },
+      "expect": {
+        "class": "Target",
+        "reason": "Timeout"
+      }
+    },
+    {
+      "id": "direct_dial_timeout_is_target_timeout",
+      "input": {
+        "type": "Timeout",
+        "op": "DirectDial",
+        "message": "direct connection timeout"
+      },
+      "expect": {
+        "class": "Target",
+        "reason": "Timeout"
+      }
+    },
+    {
+      "id": "unknown_ssh_error_defaults_to_target_other",
+      "input": {
+        "type": "SshChannel",
+        "message": "direct-tcpip: administratively prohibited"
+      },
+      "expect": {
+        "class": "Target",
+        "reason": "Other"
+      }
+    },
+    {
+      "id": "unknown_other_error_defaults_to_target_other",
+      "input": {
+        "type": "Other",
+        "message": "other dial error"
+      },
+      "expect": {
+        "class": "Target",
+        "reason": "Other"
+      }
+    }
+  ],
+  "config_cases": [
+    {
+      "id": "pprof_disabled_ignores_addr",
+      "source_tests": [
+        "TestNormalizePprofConfig"
+      ],
+      "function": "normalizePprofConfig",
+      "input": {
+        "enabled": false,
+        "addr": "127.0.0.1:9999"
+      },
+      "expect": {
+        "enabled": false,
+        "addr": ""
+      }
+    },
+    {
+      "id": "pprof_enabled_empty_addr_uses_default",
+      "source_tests": [
+        "TestNormalizePprofConfig"
+      ],
+      "function": "normalizePprofConfig",
+      "input": {
+        "enabled": true,
+        "addr": ""
+      },
+      "expect": {
+        "enabled": true,
+        "addr": "127.0.0.1:6060"
+      }
+    },
+    {
+      "id": "pprof_enabled_trims_explicit_addr",
+      "source_tests": [
+        "TestNormalizePprofConfig"
+      ],
+      "function": "normalizePprofConfig",
+      "input": {
+        "enabled": true,
+        "addr": " 127.0.0.1:7070 "
+      },
+      "expect": {
+        "enabled": true,
+        "addr": "127.0.0.1:7070"
+      }
+    },
+    {
+      "id": "event_loop_shards_explicit_positive_wins",
+      "source_tests": [
+        "TestNormalizeEventLoopShardCount"
+      ],
+      "function": "normalizeEventLoopShardCount",
+      "input": {
+        "requested": 4,
+        "cpu_count": 8
+      },
+      "expect": 4
+    },
+    {
+      "id": "event_loop_shards_zero_uses_cpu_count",
+      "source_tests": [
+        "TestNormalizeEventLoopShardCount"
+      ],
+      "function": "normalizeEventLoopShardCount",
+      "input": {
+        "requested": 0,
+        "cpu_count": 8
+      },
+      "expect": 8
+    },
+    {
+      "id": "event_loop_shards_negative_uses_cpu_count",
+      "source_tests": [
+        "TestNormalizeEventLoopShardCount"
+      ],
+      "function": "normalizeEventLoopShardCount",
+      "input": {
+        "requested": -1,
+        "cpu_count": 8
+      },
+      "expect": 8
+    },
+    {
+      "id": "event_loop_shards_bad_cpu_count_falls_back_to_one",
+      "source_tests": [
+        "TestNormalizeEventLoopShardCount"
+      ],
+      "function": "normalizeEventLoopShardCount",
+      "input": {
+        "requested": 0,
+        "cpu_count": 0
+      },
+      "expect": 1
+    },
+    {
+      "id": "compute_shard_index_zero_key",
+      "source_tests": [
+        "TestComputeShardIndex"
+      ],
+      "function": "computeShardIndex",
+      "input": {
+        "key": 0,
+        "shard_count": 4
+      },
+      "expect": 0
+    },
+    {
+      "id": "compute_shard_index_modulo",
+      "source_tests": [
+        "TestComputeShardIndex"
+      ],
+      "function": "computeShardIndex",
+      "input": {
+        "key": 5,
+        "shard_count": 4
+      },
+      "expect": 1
+    },
+    {
+      "id": "compute_shard_index_single_shard",
+      "source_tests": [
+        "TestComputeShardIndex"
+      ],
+      "function": "computeShardIndex",
+      "input": {
+        "key": 9,
+        "shard_count": 1
+      },
+      "expect": 0
+    },
+    {
+      "id": "compute_shard_index_zero_shards",
+      "source_tests": [
+        "TestComputeShardIndex"
+      ],
+      "function": "computeShardIndex",
+      "input": {
+        "key": 9,
+        "shard_count": 0
+      },
+      "expect": 0
+    },
+    {
+      "id": "hash_shard_key_is_deterministic_and_uses_inputs",
+      "source_tests": [
+        "TestHashShardKeyDeterministic"
+      ],
+      "function": "hashShardKey",
+      "input": {
+        "remote_addr": "127.0.0.1:50000",
+        "sequence": 12,
+        "remote_addr_variant": "127.0.0.1:50001",
+        "sequence_variant": 13
+      },
+      "expect": {
+        "deterministic": true,
+        "differs_by_remote_addr": true,
+        "differs_by_sequence_number": true
+      }
+    },
+    {
+      "id": "accept_shard_assignment_uses_hashed_remote_and_sequence",
+      "source_tests": [
+        "TestAssignAcceptShard"
+      ],
+      "function": "assignAcceptShard",
+      "input": {
+        "remote_addr": "127.0.0.1:50000",
+        "sequence": 12,
+        "shard_count": 4
+      },
+      "expect": 1
+    },
+    {
+      "id": "proxy_runtime_options_explicit",
+      "source_tests": [
+        "TestNormalizeProxyRuntimeOptions"
+      ],
+      "function": "normalizeProxyRuntimeOptions",
+      "input": {
+        "pool_size": 8,
+        "max_sessions": 4,
+        "event_loop_shards": 4,
+        "cpu_count": 8
+      },
+      "expect": {
+        "pool_size": 8,
+        "max_sessions": 4,
+        "event_loop_shards": 4
+      }
+    }
+  ],
+  "notes": {
+    "runtime_contracts": [
+      "Runtime-core lifecycle contracts, including payload retention/release and EOF ordering, live in spec/core_vectors.json.",
+      "Concurrency, socket tuning, fairness, and benchmark surfaces remain Go runtime tests because they are implementation contracts rather than language-neutral reducer vectors.",
+      "New protocol behavior should add reduce/helper/pool/config vectors before changing production code."
+    ]
+  }
+}

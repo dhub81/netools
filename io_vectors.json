@@ -1,0 +1,417 @@
+{
+  "schema": "ts-proxy.io-vectors.v1",
+  "description": "Executable I/O-layer behavior checks derived from 5.log. These vectors validate resource facts and Sans-I/O boundary behavior; target/network failures are legal when they are reported back as completions.",
+  "io_resource_type": "io_resource",
+  "field_types": {
+    "time_unix_nano": "int",
+    "event": "str",
+    "type": "str",
+    "result": "str",
+    "error": "str",
+    "handle": "int",
+    "client_handle": "int",
+    "remote_handle": "int",
+    "session": "int",
+    "generation": "int",
+    "op": "int",
+    "op_label": "str",
+    "source": "str",
+    "dest": "str",
+    "completion": "str",
+    "pool_idx": "int",
+    "pool_slot_id": "str",
+    "pool_op_id": "str",
+    "pool_size": "int",
+    "pool_views": "int",
+    "host": "str",
+    "port": "int",
+    "timeout_nanos": "int",
+    "buffer_id": "int",
+    "buffer_gen": "int",
+    "offset": "int",
+    "span_offset": "int",
+    "span_len": "int",
+    "span_data_len": "int",
+    "len": "int",
+    "cap": "int",
+    "length": "int",
+    "data_len": "int",
+    "payload_len": "int",
+    "payload_cap": "int",
+    "local_addr": "str",
+    "remote_addr": "str",
+    "listen_addr": "str",
+    "network": "str",
+    "addr": "str",
+    "option": "str",
+    "enabled": "bool",
+    "period_nanos": "int",
+    "bytes": "int",
+    "reason": "str",
+    "direction": "str",
+    "io_op": "str",
+    "elapsed_nanos": "int",
+    "bytes_up": "int",
+    "bytes_down": "int",
+    "first": "str",
+    "second": "str",
+    "detail": "str"
+  },
+  "events": {
+    "listener_start": {
+      "required": ["network", "addr"],
+      "allowed_results": [null]
+    },
+    "listener_done": {
+      "required": ["network", "addr", "result"],
+      "allowed_results": ["ok", "error"],
+      "error_requires": ["error"]
+    },
+    "listener_accept": {
+      "required": ["listen_addr", "result"],
+      "allowed_results": ["ok", "error"],
+      "error_requires": ["error"]
+    },
+    "accept": {
+      "required": ["handle", "remote_addr"],
+      "allowed_results": [null]
+    },
+    "tcp_set_option": {
+      "required": ["option", "result"],
+      "allowed_results": ["ok", "error"],
+      "error_requires": ["error"]
+    },
+    "tcp_tune_skipped": {
+      "required": ["reason"],
+      "allowed_results": [null]
+    },
+    "handle_register": {
+      "required": ["handle", "local_addr", "remote_addr"],
+      "allowed_results": [null]
+    },
+    "runtime_close": {
+      "required": ["handle", "result"],
+      "allowed_results": ["requested"]
+    },
+    "handle_close": {
+      "required": ["handle", "result"],
+      "allowed_results": ["ok", "error"],
+      "error_requires": ["error"]
+    },
+    "runtime_close_write": {
+      "required": ["handle", "dest", "result"],
+      "allowed_results": ["ok", "error", "unavailable"],
+      "error_requires": ["error"]
+    },
+    "buffer_store": {
+      "required": ["buffer_id", "buffer_gen", "len", "cap"],
+      "allowed_results": [null]
+    },
+    "runtime_release_buffer": {
+      "required": ["buffer_id", "buffer_gen", "result"],
+      "allowed_results": ["requested"]
+    },
+    "buffer_release": {
+      "required": ["buffer_id", "buffer_gen", "result"],
+      "allowed_results": ["ok", "ignored_zero", "stale_or_missing"]
+    },
+    "span_lookup": {
+      "required": ["buffer_id", "buffer_gen", "offset", "len", "result"],
+      "allowed_results": ["ok", "missing_buffer", "stale_or_missing", "out_of_bounds"]
+    },
+    "runtime_read_start": {
+      "required": ["session", "generation", "op", "op_label", "handle", "source", "result"],
+      "allowed_results": ["started", "unavailable"]
+    },
+    "driver_read_done": {
+      "required": ["session", "generation", "op", "op_label", "handle", "source", "completion", "length", "result"],
+      "allowed_results": ["ok"]
+    },
+    "runtime_write_start": {
+      "required": ["session", "generation", "op", "op_label", "handle", "dest", "data_len", "result"],
+      "allowed_results": ["started", "unavailable"]
+    },
+    "runtime_write_span_start": {
+      "required": ["session", "generation", "op", "op_label", "handle", "dest", "buffer_id", "buffer_gen", "span_offset", "span_len", "span_data_len", "result"],
+      "allowed_results": ["started", "span_unavailable", "unavailable"]
+    },
+    "driver_write_done": {
+      "required": ["session", "generation", "op", "op_label", "handle", "dest", "completion", "length", "result"],
+      "allowed_results": ["ok"]
+    },
+    "driver_failure": {
+      "required": ["session", "generation", "op", "op_label", "completion", "result", "error"],
+      "allowed_results": ["error"]
+    },
+    "payload_release": {
+      "required": ["reason", "payload_len", "payload_cap"],
+      "allowed_results": [null]
+    },
+    "ssh_pool_init_start": {
+      "required": ["pool_size"],
+      "allowed_results": [null]
+    },
+    "ssh_connect_start": {
+      "required": ["host", "port", "timeout_nanos"],
+      "allowed_results": [null]
+    },
+    "ssh_tcp_dial_done": {
+      "required": ["addr", "result"],
+      "allowed_results": ["ok", "error"],
+      "error_requires": ["error"]
+    },
+    "ssh_handshake_done": {
+      "required": ["addr", "result"],
+      "allowed_results": ["ok", "error"],
+      "error_requires": ["error"]
+    },
+    "ssh_tcp_close_after_handshake_error": {
+      "required": ["addr", "result"],
+      "allowed_results": ["ok", "error"],
+      "error_requires": ["error"]
+    },
+    "ssh_key_read_done": {
+      "required": ["path", "result"],
+      "allowed_results": ["ok", "error"],
+      "error_requires": ["error"]
+    },
+    "ssh_key_parse_done": {
+      "required": ["path", "result"],
+      "allowed_results": ["ok", "error"],
+      "error_requires": ["error"]
+    },
+    "ssh_pool_init_slot_done": {
+      "required": ["pool_idx", "pool_slot_id", "result"],
+      "allowed_results": ["ok", "error"],
+      "error_requires": ["error"]
+    },
+    "ssh_pool_snapshot_start": {
+      "required": ["pool_size"],
+      "allowed_results": [null]
+    },
+    "runtime_snapshot_pool": {
+      "required": ["session", "generation", "op", "op_label", "pool_views", "result"],
+      "allowed_results": ["ok", "unavailable"]
+    },
+    "runtime_ssh_slot_lookup": {
+      "required": ["session", "generation", "op", "op_label", "pool_idx", "host", "port", "result"],
+      "allowed_results": ["ok", "error"]
+    },
+    "ssh_pool_lookup_start": {
+      "required": ["pool_idx", "pool_slot_id"],
+      "allowed_results": [null]
+    },
+    "ssh_pool_lookup_done": {
+      "required": ["pool_idx", "pool_slot_id", "result"],
+      "allowed_results": ["ok", "error"],
+      "error_requires": ["error"]
+    },
+    "runtime_dial_ssh_start": {
+      "required": ["session", "generation", "op", "op_label", "pool_idx", "pool_slot_id", "host", "port", "timeout_nanos", "result"],
+      "allowed_results": ["started", "unavailable"]
+    },
+    "ssh_channel_open_start": {
+      "required": ["pool_idx", "pool_slot_id", "host", "port"],
+      "allowed_results": [null]
+    },
+    "ssh_channel_open_done": {
+      "required": ["pool_idx", "pool_slot_id", "host", "port", "result"],
+      "allowed_results": ["ok", "error"],
+      "error_requires": ["error"]
+    },
+    "driver_dial_ssh_done": {
+      "required": ["session", "generation", "op", "op_label", "pool_idx", "pool_slot_id", "completion", "result"],
+      "allowed_results": ["ok"]
+    },
+    "runtime_dial_direct_start": {
+      "required": ["session", "generation", "op", "op_label", "host", "port", "timeout_nanos", "result"],
+      "allowed_results": ["started"]
+    },
+    "driver_dial_direct_done": {
+      "required": ["session", "generation", "op", "op_label", "completion", "result"],
+      "allowed_results": ["ok"]
+    },
+    "runtime_health_check_start": {
+      "required": ["pool_idx", "pool_op_id", "result"],
+      "allowed_results": ["started", "unavailable"]
+    },
+    "ssh_health_client_lookup_start": {
+      "required": ["pool_idx"],
+      "allowed_results": [null]
+    },
+    "ssh_health_client_lookup_done": {
+      "required": ["pool_idx", "result"],
+      "allowed_results": ["ok", "error"],
+      "error_requires": ["error"]
+    },
+    "ssh_keepalive_request_start": {
+      "required": ["pool_idx", "pool_op_id", "timeout_nanos", "result"],
+      "allowed_results": ["started"]
+    },
+    "runtime_health_check_done": {
+      "required": ["pool_idx", "pool_op_id", "timeout_nanos", "result"],
+      "allowed_results": ["ok", "error"],
+      "error_requires": ["error"]
+    },
+    "runtime_mark_pool_slot_failed": {
+      "required": ["pool_idx", "result"],
+      "allowed_results": ["closing", "stale_or_missing", "unavailable"],
+      "error_requires": ["error"]
+    },
+    "ssh_pool_slot_close_start": {
+      "required": ["pool_idx"],
+      "allowed_results": [null]
+    },
+    "ssh_pool_slot_close_done": {
+      "required": ["pool_idx", "result"],
+      "allowed_results": ["ok", "error", "missing"],
+      "error_requires": ["error"]
+    },
+    "runtime_reconnect_start": {
+      "required": ["pool_idx", "pool_op_id", "reason", "result"],
+      "allowed_results": ["started", "unavailable"]
+    },
+    "ssh_pool_reconnect_owner": {
+      "required": ["pool_idx", "result"],
+      "allowed_results": ["owner"]
+    },
+    "ssh_pool_reconnect_wait": {
+      "required": ["pool_idx", "result"],
+      "allowed_results": ["waiting"]
+    },
+    "ssh_pool_reconnect_wait_done": {
+      "required": ["pool_idx", "result"],
+      "allowed_results": ["ok", "error"],
+      "error_requires": ["error"]
+    },
+    "ssh_reconnect_connect_start": {
+      "required": ["timeout_nanos"],
+      "allowed_results": [null]
+    },
+    "ssh_reconnect_connect_done": {
+      "required": ["result"],
+      "allowed_results": ["ok", "error"],
+      "error_requires": ["error"]
+    },
+    "ssh_pool_reconnect_clear": {
+      "required": ["pool_idx", "result"],
+      "allowed_results": ["ok"]
+    },
+    "ssh_pool_reconnect_done": {
+      "required": ["pool_idx", "result"],
+      "allowed_results": ["ok", "error"],
+      "error_requires": ["error"]
+    },
+    "runtime_reconnect_done": {
+      "required": ["pool_idx", "pool_op_id", "reason", "result"],
+      "allowed_results": ["ok", "error"],
+      "error_requires": ["error"]
+    },
+    "pipe_install_start": {
+      "required": ["session", "generation", "client_handle", "remote_handle", "result"],
+      "allowed_results": ["started", "unavailable"]
+    },
+    "pipe_install_done": {
+      "required": ["session", "generation", "client_handle", "remote_handle", "result"],
+      "allowed_results": ["ok", "error"],
+      "error_requires": ["error"]
+    },
+    "pipe_stall": {
+      "required": ["session", "generation", "direction", "io_op", "elapsed_nanos"],
+      "allowed_results": [null]
+    },
+    "pipe_closed": {
+      "required": ["session", "generation", "client_handle", "remote_handle", "bytes_up", "bytes_down", "first", "second", "result"],
+      "allowed_results": ["closed"]
+    },
+    "runtime_io_failure_detail": {
+      "required": ["detail", "result"],
+      "allowed_results": ["error"]
+    }
+  },
+  "state_rules": {
+    "listener_start_done": true,
+    "accept_register_sequence": true,
+    "handle_close_requires_prior_register_for_handle_number": true,
+    "runtime_close_requires_following_handle_close_unless_log_tail": true,
+    "buffer_release_requires_store": true,
+    "buffer_release_requires_runtime_release_for_ok": true,
+    "span_lookup_ok_requires_live_buffer_and_bounds": true,
+    "runtime_write_span_started_requires_span_lookup_ok": true,
+    "small_write_done_requires_start": true,
+    "read_done_requires_start": true,
+    "ssh_init_slots_unique": true,
+    "ssh_channel_open_done_requires_start": true,
+    "ssh_dial_completion_requires_open_done": true,
+    "health_check_done_requires_start": true,
+    "pool_slot_close_done_requires_start": true,
+    "pool_reconnect_owner_requires_runtime_reconnect": true,
+    "pool_reconnect_done_requires_owner_or_wait": true,
+    "errors_must_return_as_driver_failure_or_runtime_done": true
+  },
+  "frequency_rules": {
+    "description": "Control-plane events should have bounded rates. Data-plane read/write events are summarized but not thresholded here because their rate follows real traffic.",
+    "pool_size_fields": ["pool_size"],
+    "events": {
+      "runtime_health_check_start": {
+        "description": "Health checks are pool-level control events. They should scale with pool size, not with active client connections.",
+        "min_event_span_seconds": 5,
+        "max_avg_per_pool_slot_per_sec": 0.75,
+        "max_peak_per_pool_slot_per_sec": 2.5
+      },
+      "runtime_reconnect_start": {
+        "description": "Reconnect requests may burst after wake, but should not spin continuously per pool slot.",
+        "min_event_span_seconds": 5,
+        "max_avg_per_pool_slot_per_sec": 0.5,
+        "max_peak_per_pool_slot_per_sec": 4.0
+      }
+    }
+  },
+  "throughput_streams": [
+    {
+      "name": "download_read_remote",
+      "label": "download read remote->client",
+      "event": "driver_read_done",
+      "match": {
+        "source": "remote"
+      },
+      "bytes_field": "length",
+      "direction": "down"
+    },
+    {
+      "name": "upload_read_client",
+      "label": "upload read client->remote",
+      "event": "driver_read_done",
+      "match": {
+        "source": "client"
+      },
+      "bytes_field": "length",
+      "direction": "up"
+    },
+    {
+      "name": "download_write_client",
+      "label": "download write client",
+      "event": "driver_write_done",
+      "match": {
+        "dest": "client"
+      },
+      "bytes_field": "length",
+      "direction": "down"
+    },
+    {
+      "name": "upload_write_remote",
+      "label": "upload write remote",
+      "event": "driver_write_done",
+      "match": {
+        "dest": "remote"
+      },
+      "bytes_field": "length",
+      "direction": "up"
+    }
+  ],
+  "known_findings_from_5_log": {
+    "fast_com_zero_speed_is_not_a_pipe_throughput_failure": "fast.com and api.fast.com channel opens succeeded, but Netflix OCA direct-tcpip channel opens timed out before data plane start.",
+    "pool_alive_is_not_channel_capacity": "Pool alive only means SSH transport resources exist; per-target channel open can still time out.",
+    "duplicate_slot_ids_are_illegal": "5.log shows slot 0 and slot 7 sharing slot_id 42280f5e during init. Slot IDs must identify one live slot uniquely."
+  }
+}

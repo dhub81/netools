@@ -1,0 +1,4256 @@
+{
+  "schema": "runtime-core-vectors-v1",
+  "vectors": [
+    {
+      "id": "pool_supervisor_reconnects_failed_slot",
+      "config": {
+        "local_only": false,
+        "pool_supervisor_enabled": true
+      },
+      "steps": [
+        {
+          "op": "pool_supervisor_snapshot",
+          "views": [
+            {
+              "index": 0,
+              "slot_id": "slot-0",
+              "healthy": false,
+              "connected": false,
+              "usage": 0,
+              "consecutive_failures": 1
+            }
+          ]
+        },
+        {
+          "op": "tick",
+          "now": 10,
+          "expect_commands": [
+            {
+              "type": "ReconnectPoolSlot",
+              "pool_idx": 0,
+              "reason": "reconnect retry interval elapsed"
+            }
+          ]
+        },
+        {
+          "op": "pool_reconnect_ok",
+          "pool_idx": 0,
+          "pool_slot_id": "slot-0-new"
+        }
+      ]
+    },
+    {
+      "id": "orphan_dial_after_free",
+      "steps": [
+        {
+          "op": "accept",
+          "handle": 1
+        },
+        {
+          "op": "read_done",
+          "source": "Client",
+          "data": "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com\r\n\r\n",
+          "save_command": "dial"
+        },
+        {
+          "op": "dial_direct_failed",
+          "use_command": "dial",
+          "reason": "TargetRefused",
+          "save_command": "error_write",
+          "save_type": "write",
+          "expect_commands": [
+            {
+              "type": "Write",
+              "handle": 1
+            }
+          ],
+          "expect_active": true,
+          "expect_draining": true
+        },
+        {
+          "op": "write_done",
+          "dest": "Client",
+          "use_command": "error_write",
+          "expect_commands": [
+            {
+              "type": "Close",
+              "handle": 1
+            }
+          ],
+          "expect_active": false
+        },
+        {
+          "op": "dial_done",
+          "use_command": "dial",
+          "remote_handle": 2,
+          "expect_commands": [
+            {
+              "type": "Close",
+              "handle": 2
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "flush_before_free",
+      "steps": [
+        {
+          "op": "accept",
+          "handle": 1
+        },
+        {
+          "op": "read_done",
+          "source": "Client",
+          "data": "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com\r\n\r\n",
+          "save_command": "dial"
+        },
+        {
+          "op": "dial_direct_failed",
+          "use_command": "dial",
+          "reason": "TargetRefused",
+          "expect_commands": [
+            {
+              "type": "Write",
+              "handle": 1
+            }
+          ],
+          "expect_active": true,
+          "expect_draining": true
+        },
+        {
+          "op": "write_done",
+          "dest": "Client",
+          "use_command": "write",
+          "expect_commands": [
+            {
+              "type": "Close",
+              "handle": 1
+            }
+          ],
+          "expect_active": false
+        }
+      ]
+    },
+    {
+      "id": "idle_timeout",
+      "config": {
+        "pipe_idle_timeout_seconds": 2
+      },
+      "steps": [
+        {
+          "op": "accept",
+          "handle": 10
+        },
+        {
+          "op": "read_done",
+          "source": "Client",
+          "data": "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com\r\n\r\n",
+          "save_command": "dial"
+        },
+        {
+          "op": "dial_done",
+          "use_command": "dial",
+          "remote_handle": 20
+        },
+        {
+          "op": "write_done",
+          "dest": "Client",
+          "use_command": "write",
+          "expect_active": true
+        },
+        {
+          "op": "tick",
+          "now": 100,
+          "expect_active": true
+        },
+        {
+          "op": "tick",
+          "now": 101,
+          "expect_active": true
+        },
+        {
+          "op": "tick",
+          "now": 102,
+          "expect_commands": [
+            {
+              "type": "Close",
+              "handle": 10
+            },
+            {
+              "type": "Close",
+              "handle": 20
+            }
+          ],
+          "expect_active": false
+        }
+      ]
+    },
+    {
+      "id": "pool_snapshot_uses_shared_usage_for_selection",
+      "config": {
+        "local_only": false,
+        "max_sessions_per_slot": 10
+      },
+      "steps": [
+        {
+          "op": "accept",
+          "handle": 1
+        },
+        {
+          "op": "read_done",
+          "source": "Client",
+          "data": "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com\r\n\r\n",
+          "save_command": "snapshot_req",
+          "save_type": "snapshot",
+          "expect_commands": [
+            {
+              "type": "SnapshotPool"
+            }
+          ]
+        },
+        {
+          "op": "pool_snapshot",
+          "use_command": "snapshot_req",
+          "save_command": "ssh_dial",
+          "save_type": "dial",
+          "views": [
+            {
+              "index": 0,
+              "slot_id": "busy",
+              "healthy": true,
+              "connected": true,
+              "usage": 5
+            },
+            {
+              "index": 1,
+              "slot_id": "idle",
+              "healthy": true,
+              "connected": true,
+              "usage": 0
+            }
+          ],
+          "expect_commands": [
+            {
+              "type": "DialSSH",
+              "pool_idx": 1,
+              "pool_slot_id": "idle"
+            }
+          ],
+          "expect_pool_usages": [
+            {
+              "index": 0,
+              "slot_id": "busy",
+              "usage": 0
+            },
+            {
+              "index": 1,
+              "slot_id": "idle",
+              "usage": 1
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "accept_after_update_time_sets_handshake_deadline_without_timer_scan",
+      "steps": [
+        {
+          "op": "update_time",
+          "now": 100,
+          "expect_no_commands": true,
+          "expect_current_now_seconds": 100
+        },
+        {
+          "op": "accept",
+          "handle": 10,
+          "expect_commands": [
+            {
+              "type": "Read",
+              "handle": 10
+            }
+          ],
+          "expect_handshake_deadline_seconds": 105
+        },
+        {
+          "op": "update_time",
+          "now": 200,
+          "expect_no_commands": true,
+          "expect_active": true,
+          "expect_current_now_seconds": 200
+        }
+      ]
+    },
+    {
+      "id": "pool_usage_claimed_in_runtime_before_io_ack",
+      "config": {
+        "local_only": false,
+        "max_sessions_per_slot": 1
+      },
+      "steps": [
+        {
+          "op": "accept",
+          "handle": 10
+        },
+        {
+          "op": "read_done",
+          "source": "Client",
+          "data": "CONNECT a.example:443 HTTP/1.1\r\nHost: a.example\r\n\r\n",
+          "save_command": "snapshot_a",
+          "save_type": "snapshot"
+        },
+        {
+          "op": "pool_snapshot",
+          "use_command": "snapshot_a",
+          "save_command": "ssh_dial_a",
+          "save_type": "dial",
+          "views": [
+            {
+              "index": 0,
+              "slot_id": "slot-0",
+              "healthy": true,
+              "connected": true,
+              "usage": 0
+            },
+            {
+              "index": 1,
+              "slot_id": "slot-1",
+              "healthy": true,
+              "connected": true,
+              "usage": 0
+            }
+          ],
+          "expect_commands": [
+            {
+              "type": "DialSSH",
+              "pool_idx": 0,
+              "pool_slot_id": "slot-0"
+            }
+          ],
+          "expect_pool_usages": [
+            {
+              "index": 0,
+              "slot_id": "slot-0",
+              "usage": 1
+            },
+            {
+              "index": 1,
+              "slot_id": "slot-1",
+              "usage": 0
+            }
+          ]
+        },
+        {
+          "op": "accept",
+          "handle": 11
+        },
+        {
+          "op": "read_done",
+          "source": "Client",
+          "data": "CONNECT b.example:443 HTTP/1.1\r\nHost: b.example\r\n\r\n",
+          "save_command": "snapshot_b",
+          "save_type": "snapshot"
+        },
+        {
+          "op": "pool_snapshot",
+          "use_command": "snapshot_b",
+          "save_command": "ssh_dial_b",
+          "save_type": "dial",
+          "views": [
+            {
+              "index": 0,
+              "slot_id": "slot-0",
+              "healthy": true,
+              "connected": true,
+              "usage": 0
+            },
+            {
+              "index": 1,
+              "slot_id": "slot-1",
+              "healthy": true,
+              "connected": true,
+              "usage": 0
+            }
+          ],
+          "expect_commands": [
+            {
+              "type": "DialSSH",
+              "pool_idx": 1,
+              "pool_slot_id": "slot-1"
+            }
+          ],
+          "expect_pool_usages": [
+            {
+              "index": 0,
+              "slot_id": "slot-0",
+              "usage": 1
+            },
+            {
+              "index": 1,
+              "slot_id": "slot-1",
+              "usage": 1
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "slow_path_pauses_client_reads_while_connecting_and_resumes_after_dial",
+      "config": {
+        "local_only": true
+      },
+      "steps": [
+        {
+          "op": "accept",
+          "handle": 10
+        },
+        {
+          "op": "read_done",
+          "source": "Client",
+          "data": "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n",
+          "save_command": "dial",
+          "save_type": "dial",
+          "expect_commands": [
+            {
+              "type": "DialDirect"
+            }
+          ],
+          "expect_command_count": 1
+        },
+        {
+          "op": "dial_done",
+          "use_command": "dial",
+          "remote_handle": 20,
+          "save_command": "connect_ok_write",
+          "save_type": "write",
+          "expect_commands": [
+            {
+              "type": "Write",
+              "handle": 10,
+              "dest": "Client"
+            },
+            {
+              "type": "Read",
+              "handle": 20,
+              "source": "Remote"
+            }
+          ],
+          "expect_command_count": 2
+        },
+        {
+          "op": "write_done",
+          "dest": "Client",
+          "use_command": "connect_ok_write",
+          "expect_commands": [
+            {
+              "type": "Read",
+              "handle": 10,
+              "source": "Client"
+            }
+          ],
+          "expect_command_count": 1
+        }
+      ]
+    },
+    {
+      "id": "pool_usage_released_on_channel_open_failed_without_marking_slot_failed",
+      "config": {
+        "local_only": false,
+        "max_sessions_per_slot": 1,
+        "slot_cooldown_seconds": 0
+      },
+      "steps": [
+        {
+          "op": "accept",
+          "handle": 10
+        },
+        {
+          "op": "read_done",
+          "source": "Client",
+          "data": "CONNECT a.example:443 HTTP/1.1\r\nHost: a.example\r\n\r\n",
+          "save_command": "snapshot_a",
+          "save_type": "snapshot"
+        },
+        {
+          "op": "pool_snapshot",
+          "use_command": "snapshot_a",
+          "save_command": "ssh_dial",
+          "save_type": "dial",
+          "views": [
+            {
+              "index": 0,
+              "slot_id": "slot-0",
+              "healthy": true,
+              "connected": true,
+              "usage": 0
+            },
+            {
+              "index": 1,
+              "slot_id": "slot-1",
+              "healthy": true,
+              "connected": true,
+              "usage": 0
+            }
+          ],
+          "expect_commands": [
+            {
+              "type": "DialSSH",
+              "pool_idx": 0,
+              "pool_slot_id": "slot-0"
+            }
+          ],
+          "expect_pool_usages": [
+            {
+              "index": 0,
+              "slot_id": "slot-0",
+              "usage": 1
+            },
+            {
+              "index": 1,
+              "slot_id": "slot-1",
+              "usage": 0
+            }
+          ]
+        },
+        {
+          "op": "dial_ssh_target_failed",
+          "use_command": "ssh_dial",
+          "reason": "Other",
+          "expect_commands": [
+            {
+              "type": "Write",
+              "handle": 10
+            }
+          ],
+          "expect_pool_slots": [
+            {
+              "index": 0,
+              "slot_id": "slot-0",
+              "healthy": true,
+              "connected": true,
+              "usage": 0,
+              "consecutive_failures": 0
+            },
+            {
+              "index": 1,
+              "slot_id": "slot-1",
+              "healthy": true,
+              "connected": true,
+              "usage": 0,
+              "consecutive_failures": 0
+            }
+          ]
+        },
+        {
+          "op": "accept",
+          "handle": 11
+        },
+        {
+          "op": "read_done",
+          "source": "Client",
+          "data": "CONNECT b.example:443 HTTP/1.1\r\nHost: b.example\r\n\r\n",
+          "save_command": "snapshot_b",
+          "save_type": "snapshot"
+        },
+        {
+          "op": "pool_snapshot",
+          "use_command": "snapshot_b",
+          "save_command": "ssh_dial_b",
+          "save_type": "dial",
+          "views": [
+            {
+              "index": 0,
+              "slot_id": "slot-0",
+              "healthy": true,
+              "connected": true,
+              "usage": 0
+            },
+            {
+              "index": 1,
+              "slot_id": "slot-1",
+              "healthy": true,
+              "connected": true,
+              "usage": 0
+            }
+          ],
+          "expect_commands": [
+            {
+              "type": "DialSSH",
+              "pool_idx": 0,
+              "pool_slot_id": "slot-0"
+            }
+          ],
+          "expect_pool_usages": [
+            {
+              "index": 0,
+              "slot_id": "slot-0",
+              "usage": 1
+            },
+            {
+              "index": 1,
+              "slot_id": "slot-1",
+              "usage": 0
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "target_refused_from_ssh_channel_does_not_retry_other_slots",
+      "config": {
+        "local_only": false,
+        "max_sessions_per_slot": 1,
+        "slot_cooldown_seconds": 0,
+        "pool_max_health_failures": 1
+      },
+      "steps": [
+        {
+          "op": "accept",
+          "handle": 10
+        },
+        {
+          "op": "read_done",
+          "source": "Client",
+          "data": "CONNECT missing.example:443 HTTP/1.1\r\nHost: missing.example\r\n\r\n",
+          "save_command": "snapshot_a",
+          "save_type": "snapshot"
+        },
+        {
+          "op": "pool_snapshot",
+          "use_command": "snapshot_a",
+          "save_command": "ssh_dial",
+          "save_type": "dial",
+          "views": [
+            {
+              "index": 0,
+              "slot_id": "slot-0",
+              "healthy": true,
+              "connected": true,
+              "usage": 0
+            },
+            {
+              "index": 1,
+              "slot_id": "slot-1",
+              "healthy": true,
+              "connected": true,
+              "usage": 0
+            }
+          ],
+          "expect_commands": [
+            {
+              "type": "DialSSH",
+              "pool_idx": 0,
+              "pool_slot_id": "slot-0"
+            }
+          ],
+          "expect_pool_usages": [
+            {
+              "index": 0,
+              "slot_id": "slot-0",
+              "usage": 1
+            },
+            {
+              "index": 1,
+              "slot_id": "slot-1",
+              "usage": 0
+            }
+          ]
+        },
+        {
+          "op": "dial_ssh_target_failed",
+          "use_command": "ssh_dial",
+          "reason": "TargetRefused",
+          "save_command": "error_write",
+          "save_type": "write",
+          "expect_commands": [
+            {
+              "type": "Write",
+              "handle": 10
+            }
+          ],
+          "expect_active": true,
+          "expect_draining": true,
+          "expect_pool_slots": [
+            {
+              "index": 0,
+              "slot_id": "slot-0",
+              "healthy": true,
+              "connected": true,
+              "usage": 0,
+              "consecutive_failures": 0
+            },
+            {
+              "index": 1,
+              "slot_id": "slot-1",
+              "healthy": true,
+              "connected": true,
+              "usage": 0,
+              "consecutive_failures": 0
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "pool_failure_from_ssh_channel_marks_slot_and_retries_other_slot",
+      "config": {
+        "local_only": false,
+        "max_sessions_per_slot": 1,
+        "slot_cooldown_seconds": 3600,
+        "pool_max_health_failures": 2
+      },
+      "steps": [
+        {
+          "op": "tick",
+          "now": 100
+        },
+        {
+          "op": "accept",
+          "handle": 10
+        },
+        {
+          "op": "read_done",
+          "source": "Client",
+          "data": "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com\r\n\r\n",
+          "save_command": "snapshot_a",
+          "save_type": "snapshot"
+        },
+        {
+          "op": "pool_snapshot",
+          "use_command": "snapshot_a",
+          "save_command": "ssh_dial",
+          "save_type": "dial",
+          "views": [
+            {
+              "index": 0,
+              "slot_id": "slot-0",
+              "healthy": true,
+              "connected": true,
+              "usage": 0
+            },
+            {
+              "index": 1,
+              "slot_id": "slot-1",
+              "healthy": true,
+              "connected": true,
+              "usage": 0
+            }
+          ],
+          "expect_commands": [
+            {
+              "type": "DialSSH",
+              "pool_idx": 0,
+              "pool_slot_id": "slot-0"
+            }
+          ],
+          "expect_pool_usages": [
+            {
+              "index": 0,
+              "slot_id": "slot-0",
+              "usage": 1
+            },
+            {
+              "index": 1,
+              "slot_id": "slot-1",
+              "usage": 0
+            }
+          ]
+        },
+        {
+          "op": "dial_ssh_pool_failed",
+          "use_command": "ssh_dial",
+          "reason": "channel open timeout",
+          "save_command": "snapshot_retry",
+          "save_type": "snapshot",
+          "expect_commands": [
+            {
+              "type": "SnapshotPool"
+            }
+          ],
+          "expect_active": true,
+          "expect_draining": false,
+          "expect_pool_slots": [
+            {
+              "index": 0,
+              "slot_id": "slot-0",
+              "healthy": true,
+              "connected": true,
+              "usage": 0,
+              "consecutive_failures": 1
+            },
+            {
+              "index": 1,
+              "slot_id": "slot-1",
+              "healthy": true,
+              "connected": true,
+              "usage": 0,
+              "consecutive_failures": 0
+            }
+          ],
+          "expect_absent_commands": [
+            {
+              "type": "MarkPoolSlotFailed",
+              "pool_idx": 0,
+              "pool_slot_id": "slot-0"
+            }
+          ]
+        },
+        {
+          "op": "pool_snapshot",
+          "use_command": "snapshot_retry",
+          "save_command": "ssh_dial_retry",
+          "save_type": "dial",
+          "views": [
+            {
+              "index": 0,
+              "slot_id": "slot-0",
+              "healthy": true,
+              "connected": true,
+              "usage": 0
+            },
+            {
+              "index": 1,
+              "slot_id": "slot-1",
+              "healthy": true,
+              "connected": true,
+              "usage": 0
+            }
+          ],
+          "expect_commands": [
+            {
+              "type": "DialSSH",
+              "pool_idx": 1,
+              "pool_slot_id": "slot-1"
+            }
+          ],
+          "expect_pool_usages": [
+            {
+              "index": 0,
+              "slot_id": "slot-0",
+              "usage": 0
+            },
+            {
+              "index": 1,
+              "slot_id": "slot-1",
+              "usage": 1
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "dial_done_resets_runtime_slot_failures_on_current_shard",
+      "config": {
+        "local_only": false,
+        "max_sessions_per_slot": 1,
+        "pool_supervisor_enabled": true,
+        "slot_cooldown_seconds": 0
+      },
+      "steps": [
+        {
+          "op": "pool_supervisor_snapshot",
+          "views": [
+            {
+              "index": 0,
+              "slot_id": "slot-0",
+              "healthy": true,
+              "connected": true,
+              "usage": 0,
+              "consecutive_failures": 2
+            }
+          ],
+          "expect_pool_slots": [
+            {
+              "index": 0,
+              "slot_id": "slot-0",
+              "healthy": true,
+              "connected": true,
+              "consecutive_failures": 2
+            }
+          ]
+        },
+        {
+          "op": "accept",
+          "handle": 10
+        },
+        {
+          "op": "read_done",
+          "source": "Client",
+          "data": "CONNECT a.example:443 HTTP/1.1\r\nHost: a.example\r\n\r\n",
+          "save_command": "snapshot_a",
+          "save_type": "snapshot"
+        },
+        {
+          "op": "pool_snapshot",
+          "use_command": "snapshot_a",
+          "save_command": "ssh_dial",
+          "save_type": "dial",
+          "views": [
+            {
+              "index": 0,
+              "slot_id": "slot-0",
+              "healthy": true,
+              "connected": true,
+              "usage": 0,
+              "consecutive_failures": 2
+            }
+          ],
+          "expect_commands": [
+            {
+              "type": "DialSSH",
+              "pool_idx": 0,
+              "pool_slot_id": "slot-0"
+            }
+          ]
+        },
+        {
+          "op": "dial_done",
+          "use_command": "ssh_dial",
+          "remote_handle": 20,
+          "expect_pool_slots": [
+            {
+              "index": 0,
+              "slot_id": "slot-0",
+              "healthy": true,
+              "connected": true,
+              "usage": 1,
+              "consecutive_failures": 0
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "pool_usage_released_on_session_free_keeps_healthy_slot_reusable",
+      "config": {
+        "local_only": false,
+        "max_sessions_per_slot": 1
+      },
+      "steps": [
+        {
+          "op": "accept",
+          "handle": 10
+        },
+        {
+          "op": "read_done",
+          "source": "Client",
+          "data": "CONNECT a.example:443 HTTP/1.1\r\nHost: a.example\r\n\r\n",
+          "save_command": "snapshot_a",
+          "save_type": "snapshot"
+        },
+        {
+          "op": "pool_snapshot",
+          "use_command": "snapshot_a",
+          "save_command": "ssh_dial",
+          "save_type": "dial",
+          "views": [
+            {
+              "index": 0,
+              "slot_id": "slot-0",
+              "healthy": true,
+              "connected": true,
+              "usage": 0
+            },
+            {
+              "index": 1,
+              "slot_id": "slot-1",
+              "healthy": true,
+              "connected": true,
+              "usage": 0
+            }
+          ],
+          "expect_commands": [
+            {
+              "type": "DialSSH",
+              "pool_idx": 0,
+              "pool_slot_id": "slot-0"
+            }
+          ],
+          "expect_pool_usages": [
+            {
+              "index": 0,
+              "slot_id": "slot-0",
+              "usage": 1
+            },
+            {
+              "index": 1,
+              "slot_id": "slot-1",
+              "usage": 0
+            }
+          ]
+        },
+        {
+          "op": "dial_done",
+          "use_command": "ssh_dial",
+          "remote_handle": 20,
+          "save_command": "connect_write",
+          "save_type": "write"
+        },
+        {
+          "op": "write_done",
+          "dest": "Client",
+          "use_command": "connect_write"
+        },
+        {
+          "op": "read_error",
+          "use_command": "",
+          "expect_commands": [
+            {
+              "type": "Close",
+              "handle": 10
+            },
+            {
+              "type": "Close",
+              "handle": 20
+            }
+          ],
+          "expect_active": false,
+          "expect_pool_usages": [
+            {
+              "index": 0,
+              "slot_id": "slot-0",
+              "usage": 0
+            },
+            {
+              "index": 1,
+              "slot_id": "slot-1",
+              "usage": 0
+            }
+          ],
+          "source": "Remote",
+          "handle": 0,
+          "reason": "remote read failed"
+        },
+        {
+          "op": "accept",
+          "handle": 11
+        },
+        {
+          "op": "read_done",
+          "source": "Client",
+          "data": "CONNECT b.example:443 HTTP/1.1\r\nHost: b.example\r\n\r\n",
+          "save_command": "snapshot_b",
+          "save_type": "snapshot"
+        },
+        {
+          "op": "pool_snapshot",
+          "use_command": "snapshot_b",
+          "save_command": "ssh_dial_b",
+          "save_type": "dial",
+          "views": [
+            {
+              "index": 0,
+              "slot_id": "slot-0",
+              "healthy": true,
+              "connected": true,
+              "usage": 0
+            },
+            {
+              "index": 1,
+              "slot_id": "slot-1",
+              "healthy": true,
+              "connected": true,
+              "usage": 0
+            }
+          ],
+          "expect_commands": [
+            {
+              "type": "DialSSH",
+              "pool_idx": 0,
+              "pool_slot_id": "slot-0"
+            }
+          ],
+          "expect_pool_usages": [
+            {
+              "index": 0,
+              "slot_id": "slot-0",
+              "usage": 1
+            },
+            {
+              "index": 1,
+              "slot_id": "slot-1",
+              "usage": 0
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "pool_usage_reset_on_reconnect",
+      "config": {
+        "local_only": false,
+        "max_sessions_per_slot": 1
+      },
+      "steps": [
+        {
+          "op": "accept",
+          "handle": 10
+        },
+        {
+          "op": "read_done",
+          "source": "Client",
+          "data": "CONNECT a.example:443 HTTP/1.1\r\nHost: a.example\r\n\r\n",
+          "save_command": "snapshot_a",
+          "save_type": "snapshot"
+        },
+        {
+          "op": "pool_snapshot",
+          "use_command": "snapshot_a",
+          "save_command": "ssh_dial_a",
+          "save_type": "dial",
+          "views": [
+            {
+              "index": 0,
+              "slot_id": "slot-0",
+              "healthy": true,
+              "connected": true,
+              "usage": 0
+            },
+            {
+              "index": 1,
+              "slot_id": "slot-1",
+              "healthy": true,
+              "connected": true,
+              "usage": 0
+            }
+          ],
+          "expect_commands": [
+            {
+              "type": "DialSSH",
+              "pool_idx": 0,
+              "pool_slot_id": "slot-0"
+            }
+          ],
+          "expect_pool_usages": [
+            {
+              "index": 0,
+              "slot_id": "slot-0",
+              "usage": 1
+            },
+            {
+              "index": 1,
+              "slot_id": "slot-1",
+              "usage": 0
+            }
+          ]
+        },
+        {
+          "op": "pool_supervisor_snapshot",
+          "views": [
+            {
+              "index": 0,
+              "slot_id": "slot-0",
+              "healthy": false,
+              "connected": false,
+              "usage": 1,
+              "consecutive_failures": 1
+            }
+          ]
+        },
+        {
+          "op": "tick",
+          "now": 1,
+          "save_command": "reconnect_0",
+          "save_type": "reconnectPoolSlot",
+          "expect_commands": [
+            {
+              "type": "ReconnectPoolSlot",
+              "pool_idx": 0,
+              "reason": "reconnect retry interval elapsed"
+            }
+          ]
+        },
+        {
+          "op": "pool_reconnect_ok",
+          "pool_idx": 0,
+          "pool_slot_id": "slot-0-new",
+          "expect_pool_usages": [
+            {
+              "index": 0,
+              "slot_id": "slot-0-new",
+              "usage": 0
+            },
+            {
+              "index": 1,
+              "slot_id": "slot-1",
+              "usage": 0
+            }
+          ],
+          "use_command": "reconnect_0"
+        },
+        {
+          "op": "accept",
+          "handle": 11
+        },
+        {
+          "op": "read_done",
+          "source": "Client",
+          "data": "CONNECT b.example:443 HTTP/1.1\r\nHost: b.example\r\n\r\n",
+          "save_command": "snapshot_b",
+          "save_type": "snapshot"
+        },
+        {
+          "op": "pool_snapshot",
+          "use_command": "snapshot_b",
+          "save_command": "ssh_dial_b",
+          "save_type": "dial",
+          "views": [
+            {
+              "index": 0,
+              "slot_id": "slot-0-new",
+              "healthy": true,
+              "connected": true,
+              "usage": 0
+            },
+            {
+              "index": 1,
+              "slot_id": "slot-1",
+              "healthy": true,
+              "connected": true,
+              "usage": 0
+            }
+          ],
+          "expect_commands": [
+            {
+              "type": "DialSSH",
+              "pool_idx": 0,
+              "pool_slot_id": "slot-0-new"
+            }
+          ],
+          "expect_pool_usages": [
+            {
+              "index": 0,
+              "slot_id": "slot-0-new",
+              "usage": 1
+            },
+            {
+              "index": 1,
+              "slot_id": "slot-1",
+              "usage": 0
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "freeing_pool_usage_retries_waiting_pool_acquire_immediately",
+      "config": {
+        "local_only": false,
+        "max_sessions_per_slot": 1,
+        "pool_acquire_timeout_seconds": 5,
+        "pool_acquire_retry_interval_seconds": 1
+      },
+      "steps": [
+        {
+          "op": "pool_supervisor_snapshot",
+          "views": [
+            {
+              "index": 0,
+              "slot_id": "slot-0",
+              "healthy": true,
+              "connected": true,
+              "usage": 0,
+              "max_usage": 1
+            }
+          ]
+        },
+        {
+          "op": "tick",
+          "now": 10
+        },
+        {
+          "op": "accept",
+          "handle": 10
+        },
+        {
+          "op": "read_done",
+          "source": "Client",
+          "data": "CONNECT a.example:443 HTTP/1.1\r\nHost: a.example\r\n\r\n",
+          "save_command": "snapshot_a",
+          "save_type": "snapshot"
+        },
+        {
+          "op": "pool_snapshot",
+          "use_command": "snapshot_a",
+          "save_command": "ssh_dial_a",
+          "save_type": "dial",
+          "views": [
+            {
+              "index": 0,
+              "slot_id": "slot-0",
+              "healthy": true,
+              "connected": true,
+              "usage": 0,
+              "max_usage": 1
+            }
+          ],
+          "expect_commands": [
+            {
+              "type": "DialSSH",
+              "pool_idx": 0,
+              "pool_slot_id": "slot-0"
+            }
+          ],
+          "expect_pool_usages": [
+            {
+              "index": 0,
+              "slot_id": "slot-0",
+              "usage": 1
+            }
+          ]
+        },
+        {
+          "op": "accept",
+          "handle": 11
+        },
+        {
+          "op": "read_done",
+          "source": "Client",
+          "data": "CONNECT b.example:443 HTTP/1.1\r\nHost: b.example\r\n\r\n",
+          "save_command": "snapshot_b",
+          "save_type": "snapshot"
+        },
+        {
+          "op": "pool_snapshot",
+          "use_command": "snapshot_b",
+          "views": [],
+          "expect_no_commands": true,
+          "expect_active": true
+        },
+        {
+          "op": "dial_done",
+          "use_command": "ssh_dial_a",
+          "remote_handle": 20,
+          "save_command": "connect_write_a",
+          "save_type": "write"
+        },
+        {
+          "op": "write_done",
+          "dest": "Client",
+          "use_command": "connect_write_a"
+        },
+        {
+          "op": "read_eof",
+          "source": "Remote",
+          "expect_commands": [
+            {
+              "type": "CloseWrite",
+              "handle": 10
+            }
+          ],
+          "expect_active": true,
+          "expect_pool_usages": [
+            {
+              "index": 0,
+              "slot_id": "slot-0",
+              "usage": 1
+            }
+          ]
+        },
+        {
+          "op": "read_eof",
+          "source": "Client",
+          "save_command": "snapshot_retry",
+          "save_type": "snapshot",
+          "expect_commands": [
+            {
+              "type": "Close",
+              "handle": 10
+            },
+            {
+              "type": "Close",
+              "handle": 20
+            },
+            {
+              "type": "SnapshotPool"
+            }
+          ],
+          "expect_pool_usages": [
+            {
+              "index": 0,
+              "slot_id": "slot-0",
+              "usage": 0
+            }
+          ]
+        },
+        {
+          "op": "pool_snapshot",
+          "use_command": "snapshot_retry",
+          "save_command": "ssh_dial_b",
+          "save_type": "dial",
+          "views": [
+            {
+              "index": 0,
+              "slot_id": "slot-0",
+              "healthy": true,
+              "connected": true,
+              "usage": 0,
+              "max_usage": 1
+            }
+          ],
+          "expect_commands": [
+            {
+              "type": "DialSSH",
+              "pool_idx": 0,
+              "pool_slot_id": "slot-0"
+            }
+          ],
+          "expect_pool_usages": [
+            {
+              "index": 0,
+              "slot_id": "slot-0",
+              "usage": 1
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "pool_snapshot_empty_retries_on_runtime_tick",
+      "config": {
+        "local_only": false,
+        "pool_acquire_timeout_seconds": 5,
+        "pool_acquire_retry_interval_seconds": 1
+      },
+      "steps": [
+        {
+          "op": "tick",
+          "now": 10
+        },
+        {
+          "op": "accept",
+          "handle": 1
+        },
+        {
+          "op": "read_done",
+          "source": "Client",
+          "data": "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com\r\n\r\n",
+          "save_command": "snapshot_req",
+          "save_type": "snapshot",
+          "expect_commands": [
+            {
+              "type": "SnapshotPool"
+            }
+          ]
+        },
+        {
+          "op": "pool_snapshot",
+          "use_command": "snapshot_req",
+          "views": [],
+          "expect_no_commands": true,
+          "expect_active": true
+        },
+        {
+          "op": "tick",
+          "now": 11,
+          "save_command": "snapshot_retry",
+          "save_type": "snapshot",
+          "expect_commands": [
+            {
+              "type": "SnapshotPool"
+            }
+          ],
+          "expect_active": true
+        }
+      ]
+    },
+    {
+      "id": "pool_supervisor_snapshot_retries_waiting_pool_acquire_immediately",
+      "config": {
+        "local_only": false,
+        "pool_acquire_timeout_seconds": 5,
+        "pool_acquire_retry_interval_seconds": 1
+      },
+      "steps": [
+        {
+          "op": "tick",
+          "now": 10
+        },
+        {
+          "op": "accept",
+          "handle": 1
+        },
+        {
+          "op": "read_done",
+          "source": "Client",
+          "data": "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com\r\n\r\n",
+          "save_command": "snapshot_req",
+          "save_type": "snapshot",
+          "expect_commands": [
+            {
+              "type": "SnapshotPool"
+            }
+          ]
+        },
+        {
+          "op": "pool_snapshot",
+          "use_command": "snapshot_req",
+          "views": [],
+          "expect_no_commands": true,
+          "expect_active": true
+        },
+        {
+          "op": "pool_supervisor_snapshot",
+          "save_command": "snapshot_retry",
+          "save_type": "snapshot",
+          "views": [
+            {
+              "index": 0,
+              "slot_id": "slot-0",
+              "healthy": true,
+              "connected": true,
+              "usage": 0
+            }
+          ],
+          "expect_commands": [
+            {
+              "type": "SnapshotPool"
+            }
+          ],
+          "expect_active": true
+        },
+        {
+          "op": "pool_snapshot",
+          "use_command": "snapshot_retry",
+          "save_command": "ssh_dial",
+          "save_type": "dial",
+          "views": [
+            {
+              "index": 0,
+              "slot_id": "slot-0",
+              "healthy": true,
+              "connected": true,
+              "usage": 0
+            }
+          ],
+          "expect_commands": [
+            {
+              "type": "DialSSH",
+              "pool_idx": 0,
+              "pool_slot_id": "slot-0"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "pool_snapshot_empty_times_out_in_runtime",
+      "config": {
+        "local_only": false,
+        "pool_acquire_timeout_seconds": 2,
+        "pool_acquire_retry_interval_seconds": 1
+      },
+      "steps": [
+        {
+          "op": "tick",
+          "now": 20
+        },
+        {
+          "op": "accept",
+          "handle": 1
+        },
+        {
+          "op": "read_done",
+          "source": "Client",
+          "data": "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com\r\n\r\n",
+          "save_command": "snapshot_req",
+          "save_type": "snapshot",
+          "expect_commands": [
+            {
+              "type": "SnapshotPool"
+            }
+          ]
+        },
+        {
+          "op": "pool_snapshot",
+          "use_command": "snapshot_req",
+          "views": [],
+          "expect_no_commands": true,
+          "expect_active": true
+        },
+        {
+          "op": "tick",
+          "now": 22,
+          "save_command": "error_write",
+          "save_type": "write",
+          "expect_commands": [
+            {
+              "type": "Write",
+              "handle": 1
+            }
+          ],
+          "expect_draining": true
+        }
+      ]
+    },
+    {
+      "id": "late_pool_snapshot_after_draining_does_not_start_dial",
+      "config": {
+        "local_only": false,
+        "pool_acquire_timeout_seconds": 2,
+        "pool_acquire_retry_interval_seconds": 1
+      },
+      "steps": [
+        {
+          "op": "pool_supervisor_snapshot",
+          "views": [
+            {
+              "index": 0,
+              "slot_id": "slot-0",
+              "healthy": true,
+              "connected": true,
+              "usage": 0,
+              "max_usage": 1
+            }
+          ],
+          "expect_pool_usages": [
+            {
+              "index": 0,
+              "slot_id": "slot-0",
+              "usage": 0
+            }
+          ]
+        },
+        {
+          "op": "tick",
+          "now": 20
+        },
+        {
+          "op": "accept",
+          "handle": 10
+        },
+        {
+          "op": "read_done",
+          "source": "Client",
+          "data": "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n",
+          "save_command": "snapshot_req",
+          "save_type": "snapshot",
+          "expect_commands": [
+            {
+              "type": "SnapshotPool"
+            }
+          ]
+        },
+        {
+          "op": "tick",
+          "now": 22,
+          "expect_commands": [
+            {
+              "type": "Write",
+              "handle": 10
+            }
+          ],
+          "expect_draining": true
+        },
+        {
+          "op": "pool_snapshot",
+          "use_command": "snapshot_req",
+          "views": [
+            {
+              "index": 0,
+              "slot_id": "slot-0",
+              "healthy": true,
+              "connected": true,
+              "usage": 0,
+              "max_usage": 1
+            }
+          ],
+          "expect_no_commands": true,
+          "expect_draining": true,
+          "expect_pool_usages": [
+            {
+              "index": 0,
+              "slot_id": "slot-0",
+              "usage": 0
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "pool_retry_skips_recent_failed_slot",
+      "config": {
+        "local_only": false,
+        "slot_cooldown_seconds": 3600,
+        "max_sessions_per_slot": 10,
+        "pool_supervisor_enabled": true,
+        "pool_max_health_failures": 1
+      },
+      "steps": [
+        {
+          "op": "accept",
+          "handle": 1
+        },
+        {
+          "op": "tick",
+          "now": 100
+        },
+        {
+          "op": "read_done",
+          "source": "Client",
+          "data_hex": "050100",
+          "save_command": "socks_auth",
+          "save_type": "write"
+        },
+        {
+          "op": "write_done",
+          "dest": "Client",
+          "use_command": "socks_auth"
+        },
+        {
+          "op": "read_done",
+          "source": "Client",
+          "data_hex": "050100030b6578616d706c652e636f6d01bb",
+          "save_command": "snapshot_req_1",
+          "save_type": "snapshot"
+        },
+        {
+          "op": "pool_snapshot",
+          "use_command": "snapshot_req_1",
+          "save_command": "ssh_dial_1",
+          "save_type": "dial",
+          "views": [
+            {
+              "index": 0,
+              "slot_id": "slot-0",
+              "healthy": true,
+              "connected": true,
+              "usage": 0
+            },
+            {
+              "index": 1,
+              "slot_id": "slot-1",
+              "healthy": true,
+              "connected": true,
+              "usage": 0
+            }
+          ],
+          "expect_commands": [
+            {
+              "type": "DialSSH",
+              "pool_idx": 0,
+              "pool_slot_id": "slot-0"
+            }
+          ]
+        },
+        {
+          "op": "pool_supervisor_snapshot",
+          "views": [
+            {
+              "index": 0,
+              "slot_id": "slot-0",
+              "healthy": true,
+              "connected": true,
+              "usage": 0
+            }
+          ]
+        },
+        {
+          "op": "tick",
+          "now": 101,
+          "save_command": "health_0",
+          "save_type": "healthCheckPoolSlot",
+          "expect_commands": [
+            {
+              "type": "HealthCheckPoolSlot",
+              "pool_idx": 0,
+              "pool_slot_id": "slot-0"
+            }
+          ]
+        },
+        {
+          "op": "pool_health_failed",
+          "pool_idx": 0,
+          "pool_slot_id": "slot-0",
+          "reason": "health check failed",
+          "expect_commands": [
+            {
+              "type": "MarkPoolSlotFailed",
+              "pool_idx": 0,
+              "pool_slot_id": "slot-0"
+            },
+            {
+              "type": "ReconnectPoolSlot",
+              "pool_idx": 0,
+              "reason": "health check failed"
+            }
+          ],
+          "use_command": "health_0"
+        },
+        {
+          "op": "accept",
+          "handle": 2
+        },
+        {
+          "op": "read_done",
+          "handle": 2,
+          "source": "Client",
+          "data_hex": "050100",
+          "save_command": "socks_auth_2",
+          "save_type": "write"
+        },
+        {
+          "op": "write_done",
+          "dest": "Client",
+          "use_command": "socks_auth_2"
+        },
+        {
+          "op": "read_done",
+          "handle": 2,
+          "source": "Client",
+          "data_hex": "050100030b6578616d706c652e636f6d01bb",
+          "save_command": "snapshot_req_2",
+          "save_type": "snapshot"
+        },
+        {
+          "op": "pool_snapshot",
+          "use_command": "snapshot_req_2",
+          "save_command": "ssh_dial_2",
+          "save_type": "dial",
+          "views": [
+            {
+              "index": 0,
+              "slot_id": "slot-0",
+              "healthy": true,
+              "connected": true,
+              "usage": 0
+            },
+            {
+              "index": 1,
+              "slot_id": "slot-1",
+              "healthy": true,
+              "connected": true,
+              "usage": 0
+            }
+          ],
+          "expect_commands": [
+            {
+              "type": "DialSSH",
+              "pool_idx": 1,
+              "pool_slot_id": "slot-1"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "pool_failure_with_default_threshold_immediately_skips_failed_slot",
+      "config": {
+        "local_only": false,
+        "max_sessions_per_slot": 1,
+        "slot_cooldown_seconds": 3600
+      },
+      "steps": [
+        {
+          "op": "tick",
+          "now": 100
+        },
+        {
+          "op": "accept",
+          "handle": 10
+        },
+        {
+          "op": "read_done",
+          "source": "Client",
+          "data": "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com\r\n\r\n",
+          "save_command": "snapshot_a",
+          "save_type": "snapshot"
+        },
+        {
+          "op": "pool_snapshot",
+          "use_command": "snapshot_a",
+          "save_command": "ssh_dial",
+          "save_type": "dial",
+          "views": [
+            {
+              "index": 0,
+              "slot_id": "slot-0",
+              "healthy": true,
+              "connected": true,
+              "usage": 0
+            },
+            {
+              "index": 1,
+              "slot_id": "slot-1",
+              "healthy": true,
+              "connected": true,
+              "usage": 0
+            }
+          ],
+          "expect_commands": [
+            {
+              "type": "DialSSH",
+              "pool_idx": 0,
+              "pool_slot_id": "slot-0"
+            }
+          ]
+        },
+        {
+          "op": "dial_ssh_pool_failed",
+          "use_command": "ssh_dial",
+          "reason": "channel open timeout",
+          "save_command": "snapshot_retry",
+          "save_type": "snapshot",
+          "expect_commands": [
+            {
+              "type": "SnapshotPool"
+            }
+          ],
+          "expect_pool_slots": [
+            {
+              "index": 0,
+              "slot_id": "slot-0",
+              "healthy": true,
+              "connected": true,
+              "usage": 0,
+              "consecutive_failures": 1
+            }
+          ],
+          "expect_absent_commands": [
+            {
+              "type": "MarkPoolSlotFailed",
+              "pool_idx": 0,
+              "pool_slot_id": "slot-0"
+            }
+          ]
+        },
+        {
+          "op": "pool_snapshot",
+          "use_command": "snapshot_retry",
+          "save_command": "ssh_dial_retry",
+          "save_type": "dial",
+          "views": [
+            {
+              "index": 0,
+              "slot_id": "slot-0",
+              "healthy": true,
+              "connected": true,
+              "usage": 0
+            },
+            {
+              "index": 1,
+              "slot_id": "slot-1",
+              "healthy": true,
+              "connected": true,
+              "usage": 0
+            }
+          ],
+          "expect_commands": [
+            {
+              "type": "DialSSH",
+              "pool_idx": 1,
+              "pool_slot_id": "slot-1"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "pool_supervisor_snapshot_preserves_soft_channel_failure",
+      "config": {
+        "local_only": false,
+        "slot_cooldown_seconds": 3600,
+        "max_sessions_per_slot": 10
+      },
+      "steps": [
+        {
+          "op": "tick",
+          "now": 100
+        },
+        {
+          "op": "accept",
+          "handle": 10
+        },
+        {
+          "op": "read_done",
+          "source": "Client",
+          "data": "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com\r\n\r\n",
+          "save_command": "snapshot_a",
+          "save_type": "snapshot"
+        },
+        {
+          "op": "pool_snapshot",
+          "use_command": "snapshot_a",
+          "save_command": "ssh_dial",
+          "save_type": "dial",
+          "views": [
+            {
+              "index": 0,
+              "slot_id": "slot-0",
+              "healthy": true,
+              "connected": true,
+              "usage": 0
+            },
+            {
+              "index": 1,
+              "slot_id": "slot-1",
+              "healthy": true,
+              "connected": true,
+              "usage": 0
+            }
+          ],
+          "expect_commands": [
+            {
+              "type": "DialSSH",
+              "pool_idx": 0,
+              "pool_slot_id": "slot-0"
+            }
+          ]
+        },
+        {
+          "op": "dial_ssh_pool_failed",
+          "use_command": "ssh_dial",
+          "reason": "channel open timeout",
+          "save_command": "snapshot_retry",
+          "save_type": "snapshot",
+          "expect_commands": [
+            {
+              "type": "SnapshotPool"
+            }
+          ],
+          "expect_pool_slots": [
+            {
+              "index": 0,
+              "slot_id": "slot-0",
+              "healthy": true,
+              "connected": true,
+              "usage": 0,
+              "consecutive_failures": 1
+            }
+          ]
+        },
+        {
+          "op": "pool_supervisor_snapshot",
+          "views": [
+            {
+              "index": 0,
+              "slot_id": "slot-0",
+              "healthy": true,
+              "connected": true,
+              "usage": 0
+            },
+            {
+              "index": 1,
+              "slot_id": "slot-1",
+              "healthy": true,
+              "connected": true,
+              "usage": 0
+            }
+          ],
+          "expect_pool_slots": [
+            {
+              "index": 0,
+              "slot_id": "slot-0",
+              "healthy": true,
+              "connected": true,
+              "usage": 0,
+              "consecutive_failures": 1
+            }
+          ]
+        },
+        {
+          "op": "pool_snapshot",
+          "use_command": "snapshot_retry",
+          "save_command": "ssh_dial_retry",
+          "save_type": "dial",
+          "views": [
+            {
+              "index": 0,
+              "slot_id": "slot-0",
+              "healthy": true,
+              "connected": true,
+              "usage": 0
+            },
+            {
+              "index": 1,
+              "slot_id": "slot-1",
+              "healthy": true,
+              "connected": true,
+              "usage": 0
+            }
+          ],
+          "expect_commands": [
+            {
+              "type": "DialSSH",
+              "pool_idx": 1,
+              "pool_slot_id": "slot-1"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "pool_soft_channel_failures_cool_slot_without_reconnect",
+      "config": {
+        "local_only": false,
+        "pool_supervisor_enabled": true,
+        "pool_max_health_failures": 1,
+        "slot_cooldown_seconds": 3600
+      },
+      "steps": [
+        {
+          "op": "tick",
+          "now": 100
+        },
+        {
+          "op": "accept",
+          "handle": 10
+        },
+        {
+          "op": "read_done",
+          "source": "Client",
+          "data": "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com\r\n\r\n",
+          "save_command": "snapshot_a",
+          "save_type": "snapshot"
+        },
+        {
+          "op": "pool_snapshot",
+          "use_command": "snapshot_a",
+          "save_command": "ssh_dial",
+          "save_type": "dial",
+          "views": [
+            {
+              "index": 0,
+              "slot_id": "slot-0",
+              "healthy": true,
+              "connected": true,
+              "usage": 0
+            }
+          ],
+          "expect_commands": [
+            {
+              "type": "DialSSH",
+              "pool_idx": 0,
+              "pool_slot_id": "slot-0"
+            }
+          ]
+        },
+        {
+          "op": "dial_ssh_pool_failed",
+          "use_command": "ssh_dial",
+          "reason": "direct-tcpip: Channel send error",
+          "save_command": "snapshot_retry",
+          "save_type": "snapshot",
+          "expect_commands": [
+            {
+              "type": "SnapshotPool"
+            }
+          ],
+          "expect_absent_commands": [
+            {
+              "type": "MarkPoolSlotFailed",
+              "pool_idx": 0,
+              "pool_slot_id": "slot-0"
+            },
+            {
+              "type": "ReconnectPoolSlot",
+              "pool_idx": 0
+            }
+          ],
+          "expect_pool_slots": [
+            {
+              "index": 0,
+              "slot_id": "slot-0",
+              "healthy": true,
+              "connected": true,
+              "usage": 0,
+              "consecutive_failures": 1
+            }
+          ]
+        },
+        {
+          "op": "pool_supervisor_snapshot",
+          "views": [
+            {
+              "index": 0,
+              "slot_id": "slot-0",
+              "healthy": true,
+              "connected": true,
+              "usage": 0
+            }
+          ],
+          "expect_pool_slots": [
+            {
+              "index": 0,
+              "slot_id": "slot-0",
+              "healthy": true,
+              "connected": true,
+              "usage": 0,
+              "consecutive_failures": 1
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "pool_health_channel_open_timeout_cools_slot_without_reconnect",
+      "config": {
+        "local_only": false,
+        "pool_supervisor_enabled": true,
+        "pool_max_health_failures": 1,
+        "slot_cooldown_seconds": 3600
+      },
+      "steps": [
+        {
+          "op": "tick",
+          "now": 100
+        },
+        {
+          "op": "pool_supervisor_snapshot",
+          "views": [
+            {
+              "index": 0,
+              "slot_id": "slot-0",
+              "healthy": true,
+              "connected": true,
+              "usage": 0
+            }
+          ]
+        },
+        {
+          "op": "tick",
+          "now": 101,
+          "expect_commands": [
+            {
+              "type": "HealthCheckPoolSlot",
+              "pool_idx": 0,
+              "pool_slot_id": "slot-0"
+            }
+          ]
+        },
+        {
+          "op": "pool_health_failed",
+          "pool_idx": 0,
+          "pool_slot_id": "slot-0",
+          "reason": "health check: channel open timeout",
+          "expect_absent_commands": [
+            {
+              "type": "MarkPoolSlotFailed",
+              "pool_idx": 0,
+              "pool_slot_id": "slot-0"
+            },
+            {
+              "type": "ReconnectPoolSlot",
+              "pool_idx": 0
+            }
+          ],
+          "expect_pool_slots": [
+            {
+              "index": 0,
+              "slot_id": "slot-0",
+              "healthy": true,
+              "connected": true,
+              "usage": 0,
+              "consecutive_failures": 1
+            }
+          ]
+        },
+        {
+          "op": "pool_supervisor_snapshot",
+          "views": [
+            {
+              "index": 0,
+              "slot_id": "slot-0",
+              "healthy": true,
+              "connected": true,
+              "usage": 0
+            },
+            {
+              "index": 1,
+              "slot_id": "slot-1",
+              "healthy": true,
+              "connected": true,
+              "usage": 0
+            }
+          ],
+          "expect_pool_slots": [
+            {
+              "index": 0,
+              "slot_id": "slot-0",
+              "healthy": true,
+              "connected": true,
+              "usage": 0,
+              "consecutive_failures": 1
+            }
+          ]
+        },
+        {
+          "op": "accept",
+          "handle": 10
+        },
+        {
+          "op": "read_done",
+          "source": "Client",
+          "data": "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com\r\n\r\n",
+          "save_command": "snapshot_retry",
+          "save_type": "snapshot"
+        },
+        {
+          "op": "pool_snapshot",
+          "use_command": "snapshot_retry",
+          "save_command": "ssh_dial_retry",
+          "save_type": "dial",
+          "views": [
+            {
+              "index": 0,
+              "slot_id": "slot-0",
+              "healthy": true,
+              "connected": true,
+              "usage": 0
+            },
+            {
+              "index": 1,
+              "slot_id": "slot-1",
+              "healthy": true,
+              "connected": true,
+              "usage": 0
+            }
+          ],
+          "expect_commands": [
+            {
+              "type": "DialSSH",
+              "pool_idx": 1,
+              "pool_slot_id": "slot-1"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "pool_retry_allows_failed_slot_after_reconnect",
+      "config": {
+        "local_only": false,
+        "slot_cooldown_seconds": 1,
+        "max_sessions_per_slot": 10
+      },
+      "steps": [
+        {
+          "op": "accept",
+          "handle": 1
+        },
+        {
+          "op": "tick",
+          "now": 100
+        },
+        {
+          "op": "read_done",
+          "source": "Client",
+          "data_hex": "050100",
+          "save_command": "socks_auth",
+          "save_type": "write"
+        },
+        {
+          "op": "write_done",
+          "dest": "Client",
+          "use_command": "socks_auth"
+        },
+        {
+          "op": "read_done",
+          "source": "Client",
+          "data_hex": "050100030b6578616d706c652e636f6d01bb",
+          "save_command": "snapshot_req_1",
+          "save_type": "snapshot"
+        },
+        {
+          "op": "pool_snapshot",
+          "use_command": "snapshot_req_1",
+          "save_command": "ssh_dial_1",
+          "save_type": "dial",
+          "views": [
+            {
+              "index": 0,
+              "slot_id": "slot-0",
+              "healthy": true,
+              "connected": true,
+              "usage": 0
+            },
+            {
+              "index": 1,
+              "slot_id": "slot-1",
+              "healthy": true,
+              "connected": true,
+              "usage": 3
+            }
+          ],
+          "expect_commands": [
+            {
+              "type": "DialSSH",
+              "pool_idx": 0,
+              "pool_slot_id": "slot-0"
+            }
+          ]
+        },
+        {
+          "op": "dial_ssh_pool_failed",
+          "use_command": "ssh_dial_1",
+          "reason": "pool resource unavailable",
+          "save_command": "snapshot_req_2",
+          "save_type": "snapshot",
+          "expect_commands": [
+            {
+              "type": "MarkPoolSlotFailed",
+              "pool_idx": 0,
+              "pool_slot_id": "slot-0"
+            },
+            {
+              "type": "SnapshotPool"
+            }
+          ]
+        },
+        {
+          "op": "pool_supervisor_snapshot",
+          "views": [
+            {
+              "index": 0,
+              "slot_id": "slot-0",
+              "healthy": false,
+              "connected": false,
+              "usage": 0,
+              "consecutive_failures": 1
+            }
+          ]
+        },
+        {
+          "op": "tick",
+          "now": 101,
+          "save_command": "reconnect_0",
+          "save_type": "reconnectPoolSlot",
+          "expect_commands": [
+            {
+              "type": "ReconnectPoolSlot",
+              "pool_idx": 0,
+              "reason": "reconnect retry interval elapsed"
+            }
+          ]
+        },
+        {
+          "op": "pool_reconnect_ok",
+          "pool_idx": 0,
+          "pool_slot_id": "slot-0-new",
+          "use_command": "reconnect_0"
+        },
+        {
+          "op": "pool_snapshot",
+          "use_command": "snapshot_req_2",
+          "save_command": "ssh_dial_2",
+          "save_type": "dial",
+          "views": [
+            {
+              "index": 0,
+              "slot_id": "slot-0-new",
+              "healthy": true,
+              "connected": true,
+              "usage": 0
+            },
+            {
+              "index": 1,
+              "slot_id": "slot-1",
+              "healthy": true,
+              "connected": true,
+              "usage": 3
+            }
+          ],
+          "expect_commands": [
+            {
+              "type": "DialSSH",
+              "pool_idx": 0,
+              "pool_slot_id": "slot-0-new"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "pool_hard_failures_wait_instead_of_failing_socks",
+      "config": {
+        "local_only": false,
+        "max_sessions_per_slot": 1,
+        "slot_cooldown_seconds": 3600,
+        "pool_acquire_retry_interval_seconds": 1,
+        "pool_acquire_timeout_seconds": 15,
+        "pool_max_health_failures": 1
+      },
+      "steps": [
+        {
+          "op": "tick",
+          "now": 100
+        },
+        {
+          "op": "accept",
+          "handle": 1
+        },
+        {
+          "op": "read_done",
+          "source": "Client",
+          "data_hex": "050100",
+          "save_command": "socks_auth",
+          "save_type": "write"
+        },
+        {
+          "op": "write_done",
+          "dest": "Client",
+          "use_command": "socks_auth"
+        },
+        {
+          "op": "read_done",
+          "source": "Client",
+          "data_hex": "050100030b6578616d706c652e636f6d01bb",
+          "save_command": "snapshot_req_1",
+          "save_type": "snapshot"
+        },
+        {
+          "op": "pool_snapshot",
+          "use_command": "snapshot_req_1",
+          "save_command": "ssh_dial_1",
+          "save_type": "dial",
+          "views": [
+            {
+              "index": 0,
+              "slot_id": "slot-0",
+              "healthy": true,
+              "connected": true,
+              "usage": 0
+            }
+          ],
+          "expect_commands": [
+            {
+              "type": "DialSSH",
+              "pool_idx": 0,
+              "pool_slot_id": "slot-0"
+            }
+          ]
+        },
+        {
+          "op": "dial_ssh_pool_failed",
+          "use_command": "ssh_dial_1",
+          "reason": "slot not connected",
+          "save_command": "snapshot_req_2",
+          "save_type": "snapshot",
+          "expect_commands": [
+            {
+              "type": "MarkPoolSlotFailed",
+              "pool_idx": 0,
+              "pool_slot_id": "slot-0"
+            },
+            {
+              "type": "SnapshotPool"
+            }
+          ],
+          "expect_absent_commands": [
+            {
+              "type": "Write"
+            },
+            {
+              "type": "LogSessionFailure"
+            }
+          ],
+          "expect_active": true,
+          "expect_draining": false
+        },
+        {
+          "op": "pool_snapshot",
+          "use_command": "snapshot_req_2",
+          "views": [
+            {
+              "index": 0,
+              "slot_id": "slot-0",
+              "healthy": false,
+              "connected": false,
+              "usage": 0
+            }
+          ],
+          "expect_no_commands": true,
+          "expect_active": true,
+          "expect_draining": false
+        },
+        {
+          "op": "tick",
+          "now": 101,
+          "expect_commands": [
+            {
+              "type": "SnapshotPool"
+            }
+          ],
+          "expect_active": true,
+          "expect_draining": false
+        }
+      ]
+    },
+    {
+      "id": "write_done_releases_backpressure_and_resumes_remote_read",
+      "config": {
+        "pipe_buffer_high_water": 100,
+        "pipe_buffer_low_water": 50
+      },
+      "steps": [
+        {
+          "op": "accept",
+          "handle": 100
+        },
+        {
+          "op": "read_done",
+          "source": "Client",
+          "data": "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com\r\n\r\n",
+          "save_command": "dial"
+        },
+        {
+          "op": "dial_done",
+          "use_command": "dial",
+          "remote_handle": 200,
+          "save_command": "connect_write",
+          "save_type": "write"
+        },
+        {
+          "op": "write_done",
+          "dest": "Client",
+          "use_command": "connect_write",
+          "expect_write_client_bytes": 0
+        },
+        {
+          "op": "read_done",
+          "source": "Remote",
+          "data_repeat": "X",
+          "repeat_count": 120,
+          "save_command": "response_write",
+          "save_type": "write",
+          "expect_read_remote_paused": true,
+          "expect_write_client_bytes": 120
+        },
+        {
+          "op": "write_done",
+          "dest": "Client",
+          "use_command": "response_write",
+          "expect_commands": [
+            {
+              "type": "Read",
+              "source": "Remote",
+              "handle": 200
+            }
+          ],
+          "expect_read_remote_paused": false,
+          "expect_write_client_bytes": 0
+        }
+      ]
+    },
+    {
+      "id": "piping_client_data_is_forwarded_to_remote",
+      "steps": [
+        {
+          "op": "accept",
+          "handle": 100
+        },
+        {
+          "op": "read_done",
+          "source": "Client",
+          "data": "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com\r\n\r\n",
+          "save_command": "dial"
+        },
+        {
+          "op": "dial_done",
+          "use_command": "dial",
+          "remote_handle": 200,
+          "save_command": "connect_write",
+          "save_type": "write"
+        },
+        {
+          "op": "write_done",
+          "dest": "Client",
+          "use_command": "connect_write"
+        },
+        {
+          "op": "read_done",
+          "source": "Client",
+          "data": "GET /ip HTTP/1.1\r\nHost: example.com\r\n\r\n",
+          "expect_commands": [
+            {
+              "type": "Write",
+              "dest": "Remote",
+              "handle": 200
+            }
+          ],
+          "expect_write_remote_bytes": 39
+        }
+      ]
+    },
+    {
+      "id": "handshake_read_payload_released_after_protocol_parse",
+      "steps": [
+        {
+          "op": "accept",
+          "handle": 10
+        },
+        {
+          "op": "read_done",
+          "source": "Client",
+          "data_hex": "05 01 00",
+          "payload_id": "socks_greeting",
+          "expect_commands": [
+            {
+              "type": "ReleasePayload",
+              "payload_id": "socks_greeting"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "read_eof_releases_payload",
+      "steps": [
+        {
+          "op": "accept",
+          "handle": 11
+        },
+        {
+          "op": "read_eof",
+          "source": "Client",
+          "data": "xx",
+          "payload_id": "client_eof",
+          "expect_commands": [
+            {
+              "type": "ReleasePayload",
+              "payload_id": "client_eof"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "read_error_releases_payload",
+      "steps": [
+        {
+          "op": "accept",
+          "handle": 12
+        },
+        {
+          "op": "read_error",
+          "source": "Client",
+          "reason": "wsarecv: connection aborted",
+          "data": "xx",
+          "payload_id": "client_read_error",
+          "expect_commands": [
+            {
+              "type": "ReleasePayload",
+              "payload_id": "client_read_error"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "client_pipe_payload_retained_until_remote_write_done",
+      "steps": [
+        {
+          "op": "accept",
+          "handle": 100
+        },
+        {
+          "op": "read_done",
+          "source": "Client",
+          "data": "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com\r\n\r\n",
+          "save_command": "dial"
+        },
+        {
+          "op": "dial_done",
+          "use_command": "dial",
+          "remote_handle": 200,
+          "save_command": "connect_write",
+          "save_type": "write"
+        },
+        {
+          "op": "write_done",
+          "dest": "Client",
+          "use_command": "connect_write"
+        },
+        {
+          "op": "read_done",
+          "source": "Client",
+          "data": "request body",
+          "payload_id": "request_payload",
+          "save_command": "remote_write",
+          "save_type": "write",
+          "expect_commands": [
+            {
+              "type": "Write",
+              "dest": "Remote",
+              "handle": 200,
+              "payload_id": "request_payload"
+            }
+          ],
+          "expect_absent_commands": [
+            {
+              "type": "ReleasePayload",
+              "payload_id": "request_payload"
+            }
+          ],
+          "expect_write_remote_bytes": 12
+        },
+        {
+          "op": "write_done",
+          "dest": "Remote",
+          "use_command": "remote_write",
+          "expect_commands": [
+            {
+              "type": "ReleasePayload",
+              "payload_id": "request_payload"
+            }
+          ],
+          "expect_write_remote_bytes": 0
+        }
+      ]
+    },
+    {
+      "id": "write_failed_releases_active_payload",
+      "steps": [
+        {
+          "op": "accept",
+          "handle": 100
+        },
+        {
+          "op": "read_done",
+          "source": "Client",
+          "data": "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com\r\n\r\n",
+          "save_command": "dial"
+        },
+        {
+          "op": "dial_done",
+          "use_command": "dial",
+          "remote_handle": 200,
+          "save_command": "connect_write",
+          "save_type": "write"
+        },
+        {
+          "op": "write_done",
+          "dest": "Client",
+          "use_command": "connect_write"
+        },
+        {
+          "op": "read_done",
+          "source": "Client",
+          "data": "request body",
+          "payload_id": "failed_request_payload",
+          "save_command": "remote_write",
+          "save_type": "write",
+          "expect_commands": [
+            {
+              "type": "Write",
+              "dest": "Remote",
+              "handle": 200,
+              "payload_id": "failed_request_payload"
+            }
+          ],
+          "expect_absent_commands": [
+            {
+              "type": "ReleasePayload",
+              "payload_id": "failed_request_payload"
+            }
+          ]
+        },
+        {
+          "op": "write_failed",
+          "dest": "Remote",
+          "reason": "remote write failed",
+          "use_command": "remote_write",
+          "expect_commands": [
+            {
+              "type": "ReleasePayload",
+              "payload_id": "failed_request_payload"
+            },
+            {
+              "type": "LogWriteFailure",
+              "dest": "Remote",
+              "message_contains": "write remote: remote write failed"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "session_done_logs_client_first_eof_order",
+      "config": {
+        "local_only": false,
+        "max_sessions_per_slot": 10
+      },
+      "steps": [
+        {
+          "op": "accept",
+          "handle": 1
+        },
+        {
+          "op": "read_done",
+          "source": "Client",
+          "data": "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com\r\n\r\n",
+          "save_command": "snapshot_req",
+          "save_type": "snapshot"
+        },
+        {
+          "op": "pool_snapshot",
+          "use_command": "snapshot_req",
+          "save_command": "ssh_dial",
+          "save_type": "dial",
+          "views": [
+            {
+              "index": 0,
+              "slot_id": "slot-0",
+              "healthy": true,
+              "connected": true,
+              "usage": 0
+            }
+          ]
+        },
+        {
+          "op": "dial_done",
+          "use_command": "ssh_dial",
+          "remote_handle": 2,
+          "save_command": "connect_write",
+          "save_type": "write"
+        },
+        {
+          "op": "write_done",
+          "dest": "Client",
+          "use_command": "connect_write"
+        },
+        {
+          "op": "read_eof",
+          "source": "Client"
+        },
+        {
+          "op": "read_eof",
+          "source": "Remote",
+          "handle": 2,
+          "expect_commands": [
+            {
+              "type": "LogSessionDone",
+              "message_contains": "session done: reason=both eof: first=client read eof, second=remote read eof"
+            },
+            {
+              "type": "LogSessionDone",
+              "message_contains": "slot=0/slot-0"
+            },
+            {
+              "type": "LogSessionFreed",
+              "message_contains": "session freed: reason=drain complete"
+            }
+          ],
+          "expect_absent_commands": [
+            {
+              "type": "LogSessionFailure"
+            }
+          ],
+          "expect_active": false
+        }
+      ]
+    },
+    {
+      "id": "session_done_logs_remote_first_eof_order",
+      "config": {
+        "local_only": false,
+        "max_sessions_per_slot": 10
+      },
+      "steps": [
+        {
+          "op": "accept",
+          "handle": 1
+        },
+        {
+          "op": "read_done",
+          "source": "Client",
+          "data": "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com\r\n\r\n",
+          "save_command": "snapshot_req",
+          "save_type": "snapshot"
+        },
+        {
+          "op": "pool_snapshot",
+          "use_command": "snapshot_req",
+          "save_command": "ssh_dial",
+          "save_type": "dial",
+          "views": [
+            {
+              "index": 0,
+              "slot_id": "slot-0",
+              "healthy": true,
+              "connected": true,
+              "usage": 0
+            }
+          ]
+        },
+        {
+          "op": "dial_done",
+          "use_command": "ssh_dial",
+          "remote_handle": 2,
+          "save_command": "connect_write",
+          "save_type": "write"
+        },
+        {
+          "op": "write_done",
+          "dest": "Client",
+          "use_command": "connect_write"
+        },
+        {
+          "op": "read_eof",
+          "source": "Remote",
+          "handle": 2
+        },
+        {
+          "op": "read_eof",
+          "source": "Client",
+          "expect_commands": [
+            {
+              "type": "LogSessionDone",
+              "message_contains": "session done: reason=both eof: first=remote read eof, second=client read eof"
+            },
+            {
+              "type": "LogSessionFreed",
+              "message_contains": "session freed: reason=drain complete"
+            }
+          ],
+          "expect_absent_commands": [
+            {
+              "type": "LogSessionFailure"
+            }
+          ],
+          "expect_active": false
+        }
+      ]
+    },
+    {
+      "id": "client_read_error_records_close_reason_without_failure",
+      "config": {
+        "local_only": false,
+        "max_sessions_per_slot": 10
+      },
+      "steps": [
+        {
+          "op": "accept",
+          "handle": 1
+        },
+        {
+          "op": "read_done",
+          "source": "Client",
+          "data": "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com\r\n\r\n",
+          "save_command": "snapshot_req",
+          "save_type": "snapshot"
+        },
+        {
+          "op": "pool_snapshot",
+          "use_command": "snapshot_req",
+          "save_command": "ssh_dial",
+          "save_type": "dial",
+          "views": [
+            {
+              "index": 0,
+              "slot_id": "slot-0",
+              "healthy": true,
+              "connected": true,
+              "usage": 0
+            }
+          ]
+        },
+        {
+          "op": "dial_done",
+          "use_command": "ssh_dial",
+          "remote_handle": 2,
+          "save_command": "connect_write",
+          "save_type": "write"
+        },
+        {
+          "op": "write_done",
+          "dest": "Client",
+          "use_command": "connect_write"
+        },
+        {
+          "op": "read_error",
+          "source": "Client",
+          "reason": "wsarecv: connection aborted",
+          "expect_absent_commands": [
+            {
+              "type": "LogSessionFailure"
+            },
+            {
+              "type": "LogIOFailure"
+            }
+          ]
+        },
+        {
+          "op": "read_eof",
+          "source": "Remote",
+          "handle": 2,
+          "expect_commands": [
+            {
+              "type": "LogSessionDone",
+              "message_contains": "session done: reason=both eof: first=client read error: wsarecv: connection aborted, second=remote read eof"
+            }
+          ],
+          "expect_absent_commands": [
+            {
+              "type": "LogSessionFailure"
+            },
+            {
+              "type": "LogIOFailure"
+            }
+          ],
+          "expect_active": false
+        }
+      ]
+    },
+    {
+      "id": "remote_write_eof_after_remote_read_eof_is_session_done",
+      "config": {
+        "local_only": false,
+        "max_sessions_per_slot": 10
+      },
+      "steps": [
+        {
+          "op": "accept",
+          "handle": 1
+        },
+        {
+          "op": "read_done",
+          "source": "Client",
+          "data": "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com\r\n\r\n",
+          "save_command": "snapshot_req",
+          "save_type": "snapshot"
+        },
+        {
+          "op": "pool_snapshot",
+          "use_command": "snapshot_req",
+          "save_command": "ssh_dial",
+          "save_type": "dial",
+          "views": [
+            {
+              "index": 0,
+              "slot_id": "slot-0",
+              "healthy": true,
+              "connected": true,
+              "usage": 0
+            }
+          ]
+        },
+        {
+          "op": "dial_done",
+          "use_command": "ssh_dial",
+          "remote_handle": 2,
+          "save_command": "connect_write",
+          "save_type": "write"
+        },
+        {
+          "op": "write_done",
+          "dest": "Client",
+          "use_command": "connect_write"
+        },
+        {
+          "op": "read_eof",
+          "source": "Remote",
+          "handle": 2
+        },
+        {
+          "op": "read_done",
+          "source": "Client",
+          "data": "late request bytes",
+          "payload_id": "late_request_payload",
+          "save_command": "remote_write",
+          "save_type": "write",
+          "expect_commands": [
+            {
+              "type": "Write",
+              "dest": "Remote",
+              "handle": 2,
+              "payload_id": "late_request_payload"
+            }
+          ],
+          "expect_absent_commands": [
+            {
+              "type": "ReleasePayload",
+              "payload_id": "late_request_payload"
+            }
+          ]
+        },
+        {
+          "op": "write_failed",
+          "dest": "Remote",
+          "reason": "EOF",
+          "use_command": "remote_write",
+          "expect_commands": [
+            {
+              "type": "ReleasePayload",
+              "payload_id": "late_request_payload"
+            },
+            {
+              "type": "LogSessionDone",
+              "message_contains": "session done: reason=both eof: first=remote read eof, second=client read eof"
+            }
+          ],
+          "expect_absent_commands": [
+            {
+              "type": "LogWriteFailure"
+            },
+            {
+              "type": "LogSessionFailure"
+            }
+          ],
+          "expect_active": false
+        }
+      ]
+    },
+    {
+      "id": "client_write_connection_lost_after_pipe_closed_is_normal_drain",
+      "config": {
+        "local_only": false,
+        "max_sessions_per_slot": 10
+      },
+      "steps": [
+        {
+          "op": "accept",
+          "handle": 1
+        },
+        {
+          "op": "read_done",
+          "source": "Client",
+          "data_hex": "050100",
+          "save_command": "socks_auth",
+          "save_type": "write"
+        },
+        {
+          "op": "write_done",
+          "dest": "Client",
+          "use_command": "socks_auth"
+        },
+        {
+          "op": "read_done",
+          "source": "Client",
+          "data_hex": "050100030e7777772e676f6f676c652e636f6d0050",
+          "save_command": "snapshot_req",
+          "save_type": "snapshot"
+        },
+        {
+          "op": "pool_snapshot",
+          "use_command": "snapshot_req",
+          "save_command": "ssh_dial",
+          "save_type": "dial",
+          "views": [
+            {
+              "index": 0,
+              "slot_id": "slot-0",
+              "healthy": true,
+              "connected": true,
+              "usage": 0
+            }
+          ]
+        },
+        {
+          "op": "dial_done",
+          "use_command": "ssh_dial",
+          "remote_handle": 2,
+          "save_command": "socks_reply",
+          "save_type": "write"
+        },
+        {
+          "op": "write_done",
+          "dest": "Client",
+          "use_command": "socks_reply"
+        },
+        {
+          "op": "read_done",
+          "source": "Remote",
+          "data": "response body",
+          "payload_id": "response_payload",
+          "save_command": "client_write",
+          "save_type": "write",
+          "expect_commands": [
+            {
+              "type": "Write",
+              "dest": "Client",
+              "handle": 1,
+              "payload_id": "response_payload"
+            }
+          ]
+        },
+        {
+          "op": "read_eof",
+          "source": "Client",
+          "expect_commands": [
+            {
+              "type": "CloseWrite",
+              "handle": 2
+            }
+          ]
+        },
+        {
+          "op": "read_eof",
+          "source": "Remote",
+          "expect_commands": [
+            {
+              "type": "LogSessionDone",
+              "message_contains": "session done: reason=both eof: first=client read eof, second=remote read eof"
+            }
+          ],
+          "expect_absent_commands": [
+            {
+              "type": "LogWriteFailure"
+            },
+            {
+              "type": "LogSessionFailure"
+            }
+          ],
+          "expect_draining": true
+        },
+        {
+          "op": "write_failed",
+          "dest": "Client",
+          "reason": "Connection lost",
+          "use_command": "client_write",
+          "expect_commands": [
+            {
+              "type": "ReleasePayload",
+              "payload_id": "response_payload"
+            },
+            {
+              "type": "LogSessionFreed"
+            }
+          ],
+          "expect_absent_commands": [
+            {
+              "type": "LogWriteFailure"
+            },
+            {
+              "type": "LogSessionFailure"
+            }
+          ],
+          "expect_active": false
+        }
+      ]
+    },
+    {
+      "id": "stale_write_done_after_free_emits_no_commands",
+      "steps": [
+        {
+          "op": "accept",
+          "handle": 1
+        },
+        {
+          "op": "read_done",
+          "source": "Client",
+          "data": "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com\r\n\r\n",
+          "save_command": "dial"
+        },
+        {
+          "op": "dial_direct_failed",
+          "use_command": "dial",
+          "reason": "TargetRefused",
+          "save_command": "error_write",
+          "save_type": "write",
+          "expect_commands": [
+            {
+              "type": "Write",
+              "handle": 1
+            }
+          ],
+          "expect_active": true,
+          "expect_draining": true
+        },
+        {
+          "op": "write_done",
+          "dest": "Client",
+          "use_command": "error_write",
+          "expect_commands": [
+            {
+              "type": "Close",
+              "handle": 1
+            }
+          ],
+          "expect_active": false
+        },
+        {
+          "op": "write_done",
+          "dest": "Client",
+          "use_command": "error_write",
+          "expect_no_commands": true,
+          "expect_active": false
+        }
+      ]
+    },
+    {
+      "id": "stale_write_done_after_generation_reuse_emits_no_commands",
+      "steps": [
+        {
+          "op": "accept",
+          "handle": 1
+        },
+        {
+          "op": "read_done",
+          "source": "Client",
+          "data": "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com\r\n\r\n",
+          "save_command": "dial"
+        },
+        {
+          "op": "dial_direct_failed",
+          "use_command": "dial",
+          "reason": "TargetRefused",
+          "save_command": "old_write",
+          "save_type": "write",
+          "expect_commands": [
+            {
+              "type": "Write",
+              "handle": 1
+            }
+          ],
+          "expect_active": true,
+          "expect_draining": true
+        },
+        {
+          "op": "write_done",
+          "dest": "Client",
+          "use_command": "old_write",
+          "expect_commands": [
+            {
+              "type": "Close",
+              "handle": 1
+            }
+          ],
+          "expect_active": false
+        },
+        {
+          "op": "accept",
+          "handle": 99
+        },
+        {
+          "op": "write_done",
+          "dest": "Client",
+          "use_command": "old_write",
+          "expect_no_commands": true
+        }
+      ]
+    },
+    {
+      "id": "pipe_no_progress_diagnostic_emitted_and_suppressed_until_interval",
+      "config": {
+        "pipe_idle_timeout_seconds": 300
+      },
+      "steps": [
+        {
+          "op": "accept",
+          "handle": 100
+        },
+        {
+          "op": "read_done",
+          "source": "Client",
+          "data": "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com\r\n\r\n",
+          "save_command": "dial"
+        },
+        {
+          "op": "update_time",
+          "now": 1
+        },
+        {
+          "op": "dial_done",
+          "use_command": "dial",
+          "remote_handle": 200,
+          "save_command": "connect_write",
+          "save_type": "write"
+        },
+        {
+          "op": "write_done",
+          "dest": "Client",
+          "use_command": "connect_write"
+        },
+        {
+          "op": "tick",
+          "now": 30,
+          "expect_no_commands": true
+        },
+        {
+          "op": "tick",
+          "now": 31,
+          "expect_commands": [
+            {
+              "type": "EmitDiagnostic",
+              "kind": "NoProgress",
+              "level": "Debug",
+              "message_contains": "kind=NoProgress"
+            }
+          ]
+        },
+        {
+          "op": "tick",
+          "now": 45,
+          "expect_no_commands": true
+        },
+        {
+          "op": "tick",
+          "now": 61,
+          "expect_commands": [
+            {
+              "type": "EmitDiagnostic",
+              "kind": "NoProgress",
+              "level": "Debug",
+              "message_contains": "idle_for=60.0s"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "pipe_download_idle_diagnostic_emitted_when_upload_progress_continues",
+      "config": {
+        "pipe_idle_timeout_seconds": 300
+      },
+      "steps": [
+        {
+          "op": "accept",
+          "handle": 100
+        },
+        {
+          "op": "read_done",
+          "source": "Client",
+          "data": "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com\r\n\r\n",
+          "save_command": "dial"
+        },
+        {
+          "op": "update_time",
+          "now": 1
+        },
+        {
+          "op": "dial_done",
+          "use_command": "dial",
+          "remote_handle": 200,
+          "save_command": "connect_write",
+          "save_type": "write"
+        },
+        {
+          "op": "write_done",
+          "dest": "Client",
+          "use_command": "connect_write"
+        },
+        {
+          "op": "tick",
+          "now": 29,
+          "expect_no_commands": true
+        },
+        {
+          "op": "read_done",
+          "source": "Client",
+          "data": "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n",
+          "save_command": "request_write",
+          "save_type": "write",
+          "expect_write_remote_bytes": 37
+        },
+        {
+          "op": "tick",
+          "now": 35,
+          "expect_commands": [
+            {
+              "type": "EmitDiagnostic",
+              "kind": "DownloadIdle",
+              "level": "Debug",
+              "message_contains": "kind=DownloadIdle"
+            }
+          ]
+        },
+        {
+          "op": "tick",
+          "now": 50,
+          "expect_no_commands": true
+        }
+      ]
+    },
+    {
+      "id": "remote_pipe_data_resets_download_idle_warning",
+      "config": {
+        "pipe_idle_timeout_seconds": 300
+      },
+      "steps": [
+        {
+          "op": "accept",
+          "handle": 100
+        },
+        {
+          "op": "read_done",
+          "source": "Client",
+          "data": "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com\r\n\r\n",
+          "save_command": "dial"
+        },
+        {
+          "op": "update_time",
+          "now": 1
+        },
+        {
+          "op": "dial_done",
+          "use_command": "dial",
+          "remote_handle": 200,
+          "save_command": "connect_write",
+          "save_type": "write"
+        },
+        {
+          "op": "write_done",
+          "dest": "Client",
+          "use_command": "connect_write"
+        },
+        {
+          "op": "update_time",
+          "now": 10
+        },
+        {
+          "op": "read_done",
+          "source": "Client",
+          "data": "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n",
+          "save_command": "request_write",
+          "save_type": "write"
+        },
+        {
+          "op": "tick",
+          "now": 35,
+          "expect_commands": [
+            {
+              "type": "EmitDiagnostic",
+              "kind": "DownloadIdle",
+              "level": "Debug"
+            }
+          ]
+        },
+        {
+          "op": "read_done",
+          "source": "Remote",
+          "data": "HTTP/1.1 200 OK\r\n\r\n",
+          "save_command": "response_write",
+          "save_type": "write"
+        },
+        {
+          "op": "tick",
+          "now": 60,
+          "expect_no_commands": true
+        },
+        {
+          "op": "tick",
+          "now": 66,
+          "expect_commands": [
+            {
+              "type": "EmitDiagnostic",
+              "kind": "NoProgress",
+              "level": "Debug"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "pool_reconnect_failed_keeps_slot_unhealthy_and_schedules_retry",
+      "config": {
+        "local_only": false,
+        "pool_supervisor_enabled": true
+      },
+      "steps": [
+        {
+          "op": "pool_supervisor_snapshot",
+          "views": [
+            {
+              "index": 0,
+              "slot_id": "slot-0",
+              "healthy": false,
+              "connected": false,
+              "usage": 0,
+              "consecutive_failures": 1
+            }
+          ]
+        },
+        {
+          "op": "tick",
+          "now": 10,
+          "expect_commands": [
+            {
+              "type": "ReconnectPoolSlot",
+              "pool_idx": 0,
+              "reason": "reconnect retry interval elapsed"
+            }
+          ]
+        },
+        {
+          "op": "pool_reconnect_failed",
+          "pool_idx": 0,
+          "reason": "reconnect failed",
+          "expect_pool_slots": [
+            {
+              "index": 0,
+              "slot_id": "slot-0",
+              "healthy": false,
+              "connected": false,
+              "consecutive_failures": 2
+            }
+          ]
+        },
+        {
+          "op": "tick",
+          "now": 12,
+          "expect_no_commands": true
+        },
+        {
+          "op": "tick",
+          "now": 13,
+          "expect_commands": [
+            {
+              "type": "ReconnectPoolSlot",
+              "pool_idx": 0,
+              "reason": "reconnect retry interval elapsed"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "system_wake_reconnects_all_snapshot_slots",
+      "config": {
+        "local_only": false,
+        "pool_supervisor_enabled": true
+      },
+      "steps": [
+        {
+          "op": "system_wake",
+          "now": 100000000000,
+          "slept_nanos": 60000000000,
+          "views": [
+            {
+              "index": 0,
+              "slot_id": "slot-0",
+              "healthy": true,
+              "connected": true,
+              "usage": 0
+            },
+            {
+              "index": 1,
+              "slot_id": "slot-1",
+              "healthy": true,
+              "connected": true,
+              "usage": 0
+            }
+          ],
+          "expect_commands": [
+            {
+              "type": "MarkPoolSlotFailed",
+              "pool_idx": 0,
+              "pool_slot_id": "slot-0"
+            },
+            {
+              "type": "ReconnectPoolSlot",
+              "pool_idx": 0,
+              "reason": "system wake: timer gap 60.0s"
+            },
+            {
+              "type": "MarkPoolSlotFailed",
+              "pool_idx": 1,
+              "pool_slot_id": "slot-1"
+            },
+            {
+              "type": "ReconnectPoolSlot",
+              "pool_idx": 1,
+              "reason": "system wake: timer gap 60.0s"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "wake_reconnect_failure_retries_without_pool_supervisor",
+      "config": {
+        "local_only": false,
+        "pool_supervisor_enabled": false
+      },
+      "steps": [
+        {
+          "op": "system_wake",
+          "now": 100000000000,
+          "slept_nanos": 60000000000,
+          "views": [
+            {
+              "index": 0,
+              "slot_id": "slot-0",
+              "healthy": true,
+              "connected": true,
+              "usage": 0
+            }
+          ],
+          "expect_commands": [
+            {
+              "type": "MarkPoolSlotFailed",
+              "pool_idx": 0,
+              "pool_slot_id": "slot-0"
+            },
+            {
+              "type": "ReconnectPoolSlot",
+              "pool_idx": 0,
+              "reason": "system wake: timer gap 60.0s"
+            }
+          ]
+        },
+        {
+          "op": "pool_reconnect_failed",
+          "pool_idx": 0,
+          "reason": "handshake failed",
+          "expect_pool_slots": [
+            {
+              "index": 0,
+              "slot_id": "slot-0",
+              "healthy": false,
+              "connected": false,
+              "consecutive_failures": 2
+            }
+          ]
+        },
+        {
+          "op": "tick",
+          "now": 102,
+          "expect_no_commands": true
+        },
+        {
+          "op": "tick",
+          "now": 103,
+          "expect_commands": [
+            {
+              "type": "ReconnectPoolSlot",
+              "pool_idx": 0,
+              "reason": "reconnect retry interval elapsed"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "pool_health_keepalive_timeout_marks_failed_and_reconnects",
+      "config": {
+        "local_only": false,
+        "pool_supervisor_enabled": true,
+        "pool_max_health_failures": 1,
+        "slot_cooldown_seconds": 3600
+      },
+      "steps": [
+        {
+          "op": "pool_supervisor_snapshot",
+          "views": [
+            {
+              "index": 0,
+              "slot_id": "slot-0",
+              "healthy": true,
+              "connected": true,
+              "usage": 0
+            }
+          ]
+        },
+        {
+          "op": "tick",
+          "now": 100,
+          "expect_commands": [
+            {
+              "type": "HealthCheckPoolSlot",
+              "pool_idx": 0,
+              "pool_slot_id": "slot-0"
+            }
+          ]
+        },
+        {
+          "op": "pool_health_failed",
+          "pool_idx": 0,
+          "pool_slot_id": "slot-0",
+          "reason": "health check keepalive timed out",
+          "expect_commands": [
+            {
+              "type": "MarkPoolSlotFailed",
+              "pool_idx": 0,
+              "pool_slot_id": "slot-0"
+            },
+            {
+              "type": "ReconnectPoolSlot",
+              "pool_idx": 0,
+              "reason": "health check keepalive timed out"
+            }
+          ],
+          "expect_pool_slots": [
+            {
+              "index": 0,
+              "slot_id": "slot-0",
+              "healthy": false,
+              "connected": false,
+              "consecutive_failures": 1
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "pool_health_unavailable_defers_without_progress_or_failure",
+      "config": {
+        "local_only": false,
+        "pool_supervisor_enabled": true,
+        "pool_health_check_interval_seconds": 6,
+        "pool_max_health_failures": 1,
+        "slot_cooldown_seconds": 3600
+      },
+      "steps": [
+        {
+          "op": "pool_supervisor_snapshot",
+          "views": [
+            {
+              "index": 0,
+              "slot_id": "slot-0",
+              "healthy": true,
+              "connected": true,
+              "usage": 0
+            }
+          ]
+        },
+        {
+          "op": "tick",
+          "now": 100,
+          "save_command": "health",
+          "save_type": "healthCheckPoolSlot",
+          "expect_commands": [
+            {
+              "type": "HealthCheckPoolSlot",
+              "pool_idx": 0,
+              "pool_slot_id": "slot-0"
+            }
+          ],
+          "expect_pool_slots": [
+            {
+              "index": 0,
+              "slot_id": "slot-0",
+              "health_check_in_flight": true,
+              "next_health_check_seconds": 106
+            }
+          ]
+        },
+        {
+          "op": "pool_health_unavailable",
+          "use_command": "health",
+          "pool_idx": 0,
+          "pool_slot_id": "slot-0",
+          "now": 101,
+          "reason": "health check executor unavailable",
+          "expect_no_commands": true,
+          "expect_pool_slots": [
+            {
+              "index": 0,
+              "slot_id": "slot-0",
+              "healthy": true,
+              "connected": true,
+              "consecutive_failures": 0,
+              "health_check_in_flight": false,
+              "next_health_check_seconds": 107
+            }
+          ]
+        },
+        {
+          "op": "tick",
+          "now": 106.999999999,
+          "expect_no_commands": true
+        },
+        {
+          "op": "tick",
+          "now": 107,
+          "expect_commands": [
+            {
+              "type": "HealthCheckPoolSlot",
+              "pool_idx": 0,
+              "pool_slot_id": "slot-0"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "pool_supervisor_disabled_does_not_schedule_health_check",
+      "config": {
+        "local_only": false,
+        "pool_supervisor_enabled": false
+      },
+      "steps": [
+        {
+          "op": "pool_supervisor_snapshot",
+          "views": [
+            {
+              "index": 0,
+              "slot_id": "slot-0",
+              "healthy": true,
+              "connected": true,
+              "usage": 0
+            },
+            {
+              "index": 1,
+              "slot_id": "slot-1",
+              "healthy": true,
+              "connected": true,
+              "usage": 0
+            }
+          ]
+        },
+        {
+          "op": "tick",
+          "now": 100,
+          "expect_no_commands": true,
+          "expect_absent_commands": [
+            {
+              "type": "HealthCheckPoolSlot"
+            }
+          ]
+        },
+        {
+          "op": "tick",
+          "now": 1000,
+          "expect_no_commands": true,
+          "expect_absent_commands": [
+            {
+              "type": "HealthCheckPoolSlot"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "pool_slot_progress_cancels_pending_health_check_timeout",
+      "config": {
+        "local_only": false,
+        "pool_supervisor_enabled": true,
+        "pool_max_health_failures": 1,
+        "slot_cooldown_seconds": 3600
+      },
+      "steps": [
+        {
+          "op": "pool_supervisor_snapshot",
+          "views": [
+            {
+              "index": 0,
+              "slot_id": "slot-0",
+              "healthy": true,
+              "connected": true,
+              "usage": 0
+            }
+          ]
+        },
+        {
+          "op": "tick",
+          "now": 100,
+          "save_command": "health",
+          "save_type": "healthCheckPoolSlot",
+          "expect_commands": [
+            {
+              "type": "HealthCheckPoolSlot",
+              "pool_idx": 0,
+              "pool_slot_id": "slot-0"
+            }
+          ]
+        },
+        {
+          "op": "pool_slot_progress",
+          "pool_idx": 0,
+          "pool_slot_id": "slot-0",
+          "now": 104,
+          "expect_no_commands": true,
+          "expect_pool_slots": [
+            {
+              "index": 0,
+              "slot_id": "slot-0",
+              "healthy": true,
+              "connected": true,
+              "consecutive_failures": 0
+            }
+          ]
+        },
+        {
+          "op": "pool_health_failed",
+          "use_command": "health",
+          "pool_idx": 0,
+          "pool_slot_id": "slot-0",
+          "reason": "health check keepalive timed out",
+          "expect_no_commands": true,
+          "expect_pool_slots": [
+            {
+              "index": 0,
+              "slot_id": "slot-0",
+              "healthy": true,
+              "connected": true,
+              "consecutive_failures": 0
+            }
+          ]
+        },
+        {
+          "op": "tick",
+          "now": 106.999999999,
+          "expect_no_commands": true
+        },
+        {
+          "op": "tick",
+          "now": 107,
+          "expect_commands": [
+            {
+              "type": "HealthCheckPoolSlot",
+              "pool_idx": 0,
+              "pool_slot_id": "slot-0"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "dial_soft_failures_escalate_to_reconnect_after_threshold",
+      "config": {
+        "local_only": false,
+        "pool_max_health_failures": 3,
+        "slot_cooldown_seconds": 0
+      },
+      "steps": [
+        {
+          "op": "tick",
+          "now": 100
+        },
+        {
+          "op": "accept",
+          "handle": 10
+        },
+        {
+          "op": "read_done",
+          "source": "Client",
+          "data": "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com\r\n\r\n",
+          "save_command": "snap1",
+          "save_type": "snapshot"
+        },
+        {
+          "op": "pool_snapshot",
+          "use_command": "snap1",
+          "save_command": "dial1",
+          "save_type": "dial",
+          "views": [
+            {
+              "index": 0,
+              "slot_id": "slot-0",
+              "healthy": true,
+              "connected": true,
+              "usage": 0
+            }
+          ],
+          "expect_commands": [
+            {
+              "type": "DialSSH",
+              "pool_idx": 0,
+              "pool_slot_id": "slot-0"
+            }
+          ]
+        },
+        {
+          "op": "dial_ssh_pool_failed",
+          "use_command": "dial1",
+          "reason": "context deadline exceeded",
+          "save_command": "snap2",
+          "save_type": "snapshot",
+          "expect_commands": [
+            {
+              "type": "SnapshotPool"
+            }
+          ],
+          "expect_absent_commands": [
+            {
+              "type": "MarkPoolSlotFailed",
+              "pool_idx": 0
+            },
+            {
+              "type": "ReconnectPoolSlot",
+              "pool_idx": 0
+            }
+          ]
+        },
+        {
+          "op": "pool_snapshot",
+          "use_command": "snap2",
+          "save_command": "dial2",
+          "save_type": "dial",
+          "views": [
+            {
+              "index": 0,
+              "slot_id": "slot-0",
+              "healthy": true,
+              "connected": true,
+              "usage": 0
+            }
+          ],
+          "expect_commands": [
+            {
+              "type": "DialSSH",
+              "pool_idx": 0,
+              "pool_slot_id": "slot-0"
+            }
+          ]
+        },
+        {
+          "op": "dial_ssh_pool_failed",
+          "use_command": "dial2",
+          "reason": "context deadline exceeded",
+          "save_command": "snap3",
+          "save_type": "snapshot",
+          "expect_commands": [
+            {
+              "type": "SnapshotPool"
+            }
+          ],
+          "expect_absent_commands": [
+            {
+              "type": "MarkPoolSlotFailed",
+              "pool_idx": 0
+            },
+            {
+              "type": "ReconnectPoolSlot",
+              "pool_idx": 0
+            }
+          ]
+        },
+        {
+          "op": "pool_snapshot",
+          "use_command": "snap3",
+          "save_command": "dial3",
+          "save_type": "dial",
+          "views": [
+            {
+              "index": 0,
+              "slot_id": "slot-0",
+              "healthy": true,
+              "connected": true,
+              "usage": 0
+            }
+          ],
+          "expect_commands": [
+            {
+              "type": "DialSSH",
+              "pool_idx": 0,
+              "pool_slot_id": "slot-0"
+            }
+          ]
+        },
+        {
+          "op": "dial_ssh_pool_failed",
+          "use_command": "dial3",
+          "reason": "context deadline exceeded",
+          "expect_commands": [
+            {
+              "type": "MarkPoolSlotFailed",
+              "pool_idx": 0,
+              "pool_slot_id": "slot-0"
+            }
+          ],
+          "expect_pool_slots": [
+            {
+              "index": 0,
+              "slot_id": "slot-0",
+              "healthy": false,
+              "connected": false
+            }
+          ]
+        },
+        {
+          "op": "tick",
+          "now": 101,
+          "expect_commands": [
+            {
+              "type": "ReconnectPoolSlot",
+              "pool_idx": 0,
+              "reason": "reconnect retry interval elapsed"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
