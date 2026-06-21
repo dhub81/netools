@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
 
 r"""
-SSH Tunnel Proxy Server - Sans-I/O Refactored v7 
+SSH Tunnel Proxy Server - Sans-I/O Refactored v7
 
 ================================================
 
 python3 d:\py\slv313.py ^
 --ssh-host x.x.x.x ^
 --ssh-port 22 ^
+--pool-size 8 --max-sessions 4 --event-loop-shards 4 ^
 --no-log-connections ^
 --ssh-user user ^
 --ssh-key "~\.ssh\id_rsa" ^
 --local-port 3128 ^
 --test-url http://www.google.com ^
---pool-size 8 --max-sessions 4 --event-loop-shards 4 ^
---local-host 127.0.0.1
+--local-host 0.0.0.0
 
 """
 
@@ -214,7 +214,6 @@ class Config:
     pipe_buffer_low_water: int = 262144
 
     max_consecutive_failures: int = 3          # 连续失败多少次后强制重连
-    health_check_interval: float = 3.0        # 健康检查间隔(秒)
     slot_cooldown_after_failure: float = 1.0   # 失败后冷却时间(秒)
 
 
@@ -1923,6 +1922,7 @@ class Stats:
 class PoolState:
     slots: List[Optional[PoolSlot]] = field(default_factory=list)
     watchers: List[Optional[asyncio.Task]] = field(default_factory=list)
+    reconnects: Dict[int, asyncio.Task] = field(default_factory=dict)
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     closed: bool = False
 
@@ -1936,6 +1936,9 @@ class ServerState:
     active_tasks: set = field(default_factory=set)
     shard_queues: List[asyncio.Queue] = field(default_factory=list)
     shard_tasks: List[asyncio.Task] = field(default_factory=list)
+    pool_control: Any = None
+    pool_control_task: Optional[asyncio.Task] = None
+    wake_task: Optional[asyncio.Task] = None
     accept_sequence: int = 0
 
 
@@ -2064,7 +2067,16 @@ def snapshot_slots(slots: list) -> List[Optional[PoolSlotView]]:
     views: List[Optional[PoolSlotView]] = []
     for i, slot in enumerate(slots):
         if slot is None:
-            views.append(None)
+            views.append(PoolSlotView(
+                index=i,
+                slot_id=f"slot-{i}",
+                healthy=False,
+                is_connected=False,
+                consecutive_failures=0,
+                last_failure_time=0.0,
+                last_used=0.0,
+                usage=0,
+            ))
         else:
             views.append(PoolSlotView(
                 index=i,
@@ -2129,14 +2141,6 @@ def apply_slot_success(current_failures: int) -> int:   # noqa: ARG001
     return 0
 
 
-def should_watcher_reconnect(
-    consecutive_failures: int,
-    max_consecutive_failures: int,
-) -> bool:
-    """Pure: used by watch_connection health-check tick."""
-    return consecutive_failures >= max_consecutive_failures
-
-
 # ============================================================================
 # SSH Pool
 # ============================================================================
@@ -2184,6 +2188,76 @@ def init_pool_state(size: int) -> PoolState:
     return PoolState(slots=[None] * size, watchers=[None] * size)
 
 
+async def reconnect_slot_once(cfg: Config, pool: PoolState, idx: int, log: logging.Logger) -> tuple[bool, str]:
+    if idx < 0 or idx >= len(pool.slots):
+        return False, "invalid pool index"
+    async with pool.lock:
+        existing = pool.reconnects.get(idx)
+        if existing is None or existing.done():
+            task = asyncio.create_task(_reconnect_slot_owner(cfg, pool, idx, log))
+            pool.reconnects[idx] = task
+            owner = True
+        else:
+            task = existing
+            owner = False
+    if not owner:
+        io_resource_log(cfg, "ssh_pool_reconnect_wait", pool_idx=idx, result="waiting")
+        try:
+            ok, detail = await task
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            ok, detail = False, str(exc)
+        io_resource_log(
+            cfg,
+            "ssh_pool_reconnect_wait_done",
+            pool_idx=idx,
+            result="ok" if ok else "error",
+            **({} if ok else {"error": detail}),
+        )
+        return ok, detail
+    io_resource_log(cfg, "ssh_pool_reconnect_owner", pool_idx=idx, result="owner")
+    try:
+        ok, detail = await task
+    finally:
+        async with pool.lock:
+            if pool.reconnects.get(idx) is task:
+                pool.reconnects.pop(idx, None)
+        io_resource_log(cfg, "ssh_pool_reconnect_clear", pool_idx=idx, result="ok")
+    io_resource_log(
+        cfg,
+        "ssh_pool_reconnect_done",
+        pool_idx=idx,
+        result="ok" if ok else "error",
+        **({} if ok else {"error": detail}),
+    )
+    return ok, detail
+
+
+async def _reconnect_slot_owner(cfg: Config, pool: PoolState, idx: int, log: logging.Logger) -> tuple[bool, str]:
+    try:
+        io_resource_log(cfg, "ssh_reconnect_connect_start", timeout_nanos=int(cfg.connection_timeout * NANO))
+        new_conn = await create_ssh_connection(cfg)
+        io_resource_log(cfg, "ssh_reconnect_connect_done", result="ok")
+        new_slot = PoolSlot(conn=new_conn)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        io_resource_log(cfg, "ssh_reconnect_connect_done", result="error", error=str(exc))
+        return False, str(exc)
+    async with pool.lock:
+        if pool.closed:
+            try:
+                new_conn.close()
+                await asyncio.wait_for(new_conn.wait_closed(), timeout=3.0)
+            except Exception:
+                pass
+            return False, "pool closed"
+        pool.slots[idx] = new_slot
+    log.info(f"  ✓ Connection #{idx} re-established (...{new_slot.slot_id})")
+    return True, new_slot.slot_id
+
+
 def build_ssh_kwargs(c: Config) -> Dict[str, Any]:
     kw: Dict[str, Any] = {
         "host": c.ssh_host,
@@ -2209,92 +2283,32 @@ async def create_ssh_connection(cfg: Config):
     )
 
 
-# ✅ 修复 — 补回完整的重连循环
 async def watch_connection(cfg: Config, pool: PoolState, idx: int, log: logging.Logger):
     while not pool.closed:
         async with pool.lock:
             slot = pool.slots[idx]
-
-        if slot and slot.conn:
-            try:
-                await asyncio.wait_for(
-                    slot.conn.wait_closed(),
-                    timeout=cfg.health_check_interval
-                )
-                # wait_closed 正常返回 → 连接已死
-            except asyncio.TimeoutError:
-                # 超时 → 连接可能还活着，检查失败计数
-                async with pool.lock:
-                    current_slot = pool.slots[idx]
-                if current_slot and current_slot is slot:
-                    # if current_slot.consecutive_failures > 0:
-                    # === 修复 #2: 健康检查放宽 ===
-                    if should_watcher_reconnect(
-                        current_slot.consecutive_failures,
-                        cfg.max_consecutive_failures,
-                    ):
-                        log.warning(
-                            f"Connection #{idx} (...{slot.slot_id}) has "
-                            f"{current_slot.consecutive_failures} failures "
-                            f"— forcing reconnect"
-                        )
-                        async with pool.lock:
-                            if pool.slots[idx] is slot:
-                                try:
-                                    slot.conn.close()
-                                except Exception:
-                                    pass
-                                pool.slots[idx] = None
-                        # ↓ 跳出 if，进入下面的重连循环
-                    else:
-                        continue  # 健康，继续监视
-                else:
-                    continue  # slot 已被替换
-            except asyncio.CancelledError:
-                break
-            except Exception:
-                pass
-        else:
+        if slot is None or slot.conn is None:
             try:
                 await asyncio.sleep(cfg.retry_delay)
             except asyncio.CancelledError:
                 break
+            continue
+        try:
+            await slot.conn.wait_closed()
+        except asyncio.CancelledError:
+            break
+        except Exception:
+            pass
 
         if pool.closed:
             break
 
         if slot and slot.conn:
-            log.warning(f"Connection #{idx} (...{slot.slot_id}) lost. Reconnecting...")
+            log.warning(f"Connection #{idx} (...{slot.slot_id}) lost.")
 
         async with pool.lock:
-            pool.slots[idx] = None
-
-        # ★★★ 重连循环（之前被删除了）★★★
-        rc = 0
-        while not pool.closed:
-            rc += 1
-            try:
-                new_conn = await create_ssh_connection(cfg)
-                new_slot = PoolSlot(conn=new_conn)
-                async with pool.lock:
-                    pool.slots[idx] = new_slot
-                log.info(
-                    f"  ✓ Connection #{idx} re-established (...{new_slot.slot_id})"
-                )
-                break
-            except asyncio.CancelledError:
-                return
-            except Exception as e:
-                delay = min(cfg.retry_delay * (2 ** (rc - 1)), 30.0)
-                if rc <= 3:
-                    log.warning(
-                        f"  ✗ Reconnect #{idx} attempt {rc} failed: {e}. "
-                        f"Retry in {delay:.1f}s..."
-                    )
-                try:
-                    await asyncio.sleep(delay)
-                except asyncio.CancelledError:
-                    return
+            if idx < len(pool.slots) and pool.slots[idx] is slot:
+                pool.slots[idx] = None
 
 
 async def create_initial_connection(
@@ -2386,6 +2400,14 @@ async def close_pool(pool: PoolState):
     for w in pool.watchers:
         if w and not w.done():
             w.cancel()
+    async with pool.lock:
+        reconnect_tasks = list(pool.reconnects.values())
+        pool.reconnects.clear()
+    for task in reconnect_tasks:
+        if not task.done():
+            task.cancel()
+    if reconnect_tasks:
+        await asyncio.gather(*reconnect_tasks, return_exceptions=True)
 
     async with pool.lock:
         for i, slot in enumerate(pool.slots):
@@ -2440,6 +2462,12 @@ class RuntimeHandleEntry:
     pool_slot_id: str = ""
 
 
+@dataclass
+class RuntimeBufferEntry:
+    data: bytes
+    generation: int
+
+
 class RuntimeWorld:
     def __init__(
         self,
@@ -2455,6 +2483,8 @@ class RuntimeWorld:
         self.core = RuntimeCore(_runtime_config_from_cfg(cfg))
         self.completions: asyncio.Queue = asyncio.Queue()
         self.handles: Dict[int, RuntimeHandleEntry] = {}
+        self.buffers: Dict[int, RuntimeBufferEntry] = {}
+        self.next_buffer_id = 1
         self.tasks: set = set()
         self.next_handle = 1
         self.closed = False
@@ -2556,6 +2586,8 @@ class RuntimeWorld:
             return await self.start_read(command)
         if ctype == "writeInline":
             return await self.start_write(command)
+        if ctype == "writeSpan":
+            return await self.start_write_span(command)
         if ctype == "dialDirect":
             return await self.start_direct_dial(command)
         if ctype == "snapshotPool":
@@ -2572,6 +2604,11 @@ class RuntimeWorld:
         if ctype == "releasePayload":
             self.release_payload(command.get("payload"), "runtime")
             return []
+        if ctype == "releaseBuffer":
+            self.release_buffer(command.get("buffer"))
+            return []
+        if ctype == "installPipe":
+            return await self.install_pipe(command)
         if ctype == "logSessionDone":
             self.log.debug(command.get("text", "session done"))
             return []
@@ -2579,16 +2616,19 @@ class RuntimeWorld:
             self.log.debug(command.get("text", "session freed"))
             return []
         if ctype == "logSessionFailed":
+            text = command.get("text", "session failed")
             self.state.stats.errors += 1
-            self.log.warning(command.get("text", "session failed"))
+            self.log.debug(text)
             return []
         if ctype == "logWriteFailure":
+            text = command.get("text", "write failed")
             self.state.stats.errors += 1
-            self.log.warning(command.get("text", "write failed"))
+            self.log.debug(text)
             return []
         if ctype == "logIOFailure":
+            text = command.get("text", "io failed")
             self.state.stats.errors += 1
-            self.log.warning(command.get("text", "io failed"))
+            self.log.debug(text)
             return []
         if ctype == "emitDiagnostic":
             self.log.debug(command.get("text", "diagnostic"))
@@ -2596,8 +2636,6 @@ class RuntimeWorld:
         if ctype == "markPoolSlotFailed":
             await self.mark_pool_slot_failed(command)
             return []
-        if ctype == "healthCheckPoolSlot":
-            return await self.health_check_pool_slot(command)
         if ctype == "reconnectPoolSlot":
             return await self.reconnect_pool_slot(command)
         return []
@@ -2609,6 +2647,9 @@ class RuntimeWorld:
         entry = self.handles.get(handle)
         fields = self.token_fields(token)
         fields.update({"handle": handle, "source": source})
+        frame_mode = command.get("frameMode", "")
+        if frame_mode:
+            fields["frame_mode"] = frame_mode
         if entry is None or entry.reader is None:
             io_resource_log(self.cfg, "runtime_read_start", **fields, result="unavailable", error="handle unavailable")
             return [{
@@ -2632,6 +2673,31 @@ class RuntimeWorld:
         try:
             data = await reader.read(self.cfg.buffer_size)
             if data:
+                frame_mode = command.get("frameMode", "")
+                if frame_mode:
+                    fields["frame_mode"] = frame_mode
+                if frame_mode in ("detectInitial", "socksGreeting", "socksRequest", "httpHeader"):
+                    frame = self.store_frame(data)
+                    protocol_len, frame_kind = self.frame_protocol_prefix(data, frame_mode)
+                    raw_len = max(0, len(data) - protocol_len)
+                    completion = "read_frame"
+                    io_resource_log(self.cfg, "driver_read_done", **fields, completion=completion, length=len(data), result="ok")
+                    await self.completions.put({
+                        "type": "readFrame",
+                        "token": token,
+                        "handle": handle,
+                        "source": source,
+                        "frameKind": frame_kind,
+                        "frame": {
+                            "buffer": frame["buffer"],
+                            "protocolOffset": 0,
+                            "protocolLen": protocol_len,
+                            "rawOffset": protocol_len,
+                            "rawLen": raw_len,
+                        },
+                        "protocolBytes": data[:protocol_len],
+                    })
+                    return
                 payload = {"len": len(data), "cap": len(data)}
                 completion = "read_done"
                 io_resource_log(self.cfg, "driver_read_done", **fields, completion=completion, length=len(data), result="ok")
@@ -2645,6 +2711,9 @@ class RuntimeWorld:
                 })
             else:
                 completion = "read_eof"
+                frame_mode = command.get("frameMode", "")
+                if frame_mode:
+                    fields["frame_mode"] = frame_mode
                 io_resource_log(self.cfg, "driver_read_done", **fields, completion=completion, length=0, result="ok")
                 await self.completions.put({
                     "type": "readEOF",
@@ -2655,6 +2724,9 @@ class RuntimeWorld:
         except asyncio.CancelledError:
             return
         except Exception as exc:
+            frame_mode = command.get("frameMode", "")
+            if frame_mode:
+                fields["frame_mode"] = frame_mode
             io_resource_log(
                 self.cfg,
                 "driver_failure",
@@ -2670,6 +2742,46 @@ class RuntimeWorld:
                 "source": source,
                 "error": str(exc),
             })
+
+    async def start_write_span(self, command: Dict[str, Any]) -> List[Dict[str, Any]]:
+        span = command.get("span") or {}
+        data = self.span_bytes(span)
+        if data is None:
+            token = command["token"]
+            fields = self.token_fields(token)
+            fields.update({
+                "handle": int(command["handle"]),
+                "dest": command["dest"],
+                "buffer_id": int((span.get("buffer") or {}).get("id", 0) or 0),
+                "buffer_gen": int((span.get("buffer") or {}).get("gen", 0) or 0),
+                "span_offset": int(span.get("offset", 0) or 0),
+                "span_len": int(span.get("len", 0) or 0),
+                "span_data_len": 0,
+            })
+            io_resource_log(self.cfg, "runtime_write_span_start", **fields, result="span_unavailable", error="span unavailable")
+            return [{
+                "type": "writeFailed",
+                "token": token,
+                "handle": int(command["handle"]),
+                "dest": command["dest"],
+                "error": "span unavailable",
+            }]
+        command = dict(command)
+        command["bytes"] = data
+        command["payload"] = {"buffer": span.get("buffer")}
+        token = command["token"]
+        fields = self.token_fields(token)
+        fields.update({
+            "handle": int(command["handle"]),
+            "dest": command["dest"],
+            "buffer_id": int((span.get("buffer") or {}).get("id", 0) or 0),
+            "buffer_gen": int((span.get("buffer") or {}).get("gen", 0) or 0),
+            "span_offset": int(span.get("offset", 0) or 0),
+            "span_len": int(span.get("len", 0) or 0),
+            "span_data_len": len(data),
+        })
+        io_resource_log(self.cfg, "runtime_write_span_start", **fields, result="started")
+        return await self.start_write(command)
 
     async def start_write(self, command: Dict[str, Any]) -> List[Dict[str, Any]]:
         token = command["token"]
@@ -2799,15 +2911,11 @@ class RuntimeWorld:
 
     async def snapshot_pool(self, command: Dict[str, Any]) -> Dict[str, Any]:
         token = command["token"]
-        fields = self.token_fields(token)
         if self.state.pool is None:
-            io_resource_log(self.cfg, "runtime_snapshot_pool", **fields, pool_views=0, result="unavailable", error="pool unavailable")
             return {"type": "poolSnapshot", "token": token, "poolViews": []}
-        io_resource_log(self.cfg, "ssh_pool_snapshot_start", pool_size=len(self.state.pool.slots))
         async with self.state.pool.lock:
             views = snapshot_slots(self.state.pool.slots)
         out = [_pool_view_to_core_dict(v) for v in views if v is not None]
-        io_resource_log(self.cfg, "runtime_snapshot_pool", **fields, pool_views=len(out), result="ok")
         return {"type": "poolSnapshot", "token": token, "poolViews": out}
 
     async def start_ssh_dial(self, command: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -2936,12 +3044,73 @@ class RuntimeWorld:
         else:
             io_resource_log(self.cfg, "handle_close", handle=handle, local_addr=entry.local_addr, remote_addr=entry.remote_addr, result=result)
 
+    def store_frame(self, data: bytes) -> Dict[str, Any]:
+        buffer_id = self.next_buffer_id
+        self.next_buffer_id += 1
+        generation = 1
+        self.buffers[buffer_id] = RuntimeBufferEntry(data=data, generation=generation)
+        io_resource_log(self.cfg, "buffer_store", buffer_id=buffer_id, buffer_gen=generation, len=len(data), cap=len(data))
+        return {"buffer": {"id": str(buffer_id), "gen": generation}}
+
+    def span_bytes(self, span: Dict[str, Any]) -> Optional[bytes]:
+        buffer = span.get("buffer") or {}
+        buffer_id = int(buffer.get("id", 0) or 0)
+        buffer_gen = int(buffer.get("gen", 0) or 0)
+        offset = int(span.get("offset", 0) or 0)
+        length = int(span.get("len", 0) or 0)
+        entry = self.buffers.get(buffer_id)
+        if entry is None or entry.generation != buffer_gen:
+            io_resource_log(self.cfg, "span_lookup", buffer_id=buffer_id, buffer_gen=buffer_gen, offset=offset, len=length, result="missing_buffer")
+            return None
+        end = offset + length
+        if offset < 0 or length < 0 or end > len(entry.data):
+            io_resource_log(self.cfg, "span_lookup", buffer_id=buffer_id, buffer_gen=buffer_gen, offset=offset, len=length, result="out_of_bounds")
+            return None
+        io_resource_log(self.cfg, "span_lookup", buffer_id=buffer_id, buffer_gen=buffer_gen, offset=offset, len=length, result="ok")
+        return entry.data[offset:end]
+
+    def release_buffer(self, buffer: Optional[Dict[str, Any]]) -> None:
+        if not buffer:
+            return
+        buffer_id = int(buffer.get("id", 0) or 0)
+        buffer_gen = int(buffer.get("gen", 0) or 0)
+        io_resource_log(self.cfg, "runtime_release_buffer", buffer_id=buffer_id, buffer_gen=buffer_gen, result="requested")
+        entry = self.buffers.pop(buffer_id, None)
+        if entry is None or entry.generation != buffer_gen:
+            io_resource_log(self.cfg, "buffer_release", buffer_id=buffer_id, buffer_gen=buffer_gen, result="stale_or_missing")
+            return
+        io_resource_log(self.cfg, "buffer_release", buffer_id=buffer_id, buffer_gen=buffer_gen, result="ok")
+
     def release_payload(self, payload: Optional[Dict[str, Any]], reason: str) -> None:
         if not payload:
+            return
+        if isinstance(payload, dict) and payload.get("buffer") is not None:
+            self.release_buffer(payload.get("buffer"))
             return
         length = int(payload.get("len", payload.get("length", 0)) or 0)
         cap = int(payload.get("cap", length) or 0)
         io_resource_log(self.cfg, "payload_release", reason=reason, payload_len=length, payload_cap=cap)
+
+    def frame_protocol_prefix(self, data: bytes, frame_mode: str) -> tuple[int, str]:
+        if frame_mode in ("detectInitial", "socksGreeting") and data.startswith(b"\x05") and len(data) >= 2:
+            size = 2 + data[1]
+            if data[1] <= 8 and len(data) >= size:
+                return size, "socksGreeting"
+        if frame_mode in ("detectInitial", "socksRequest") and data.startswith(b"\x05") and len(data) >= 7:
+            atyp = data[3]
+            if atyp == 1 and len(data) >= 10:
+                return 10, "socksRequest"
+            if atyp == 3 and len(data) >= 5:
+                size = 7 + data[4]
+                if len(data) >= size:
+                    return size, "socksRequest"
+            if atyp == 4 and len(data) >= 22:
+                return 22, "socksRequest"
+        if frame_mode in ("detectInitial", "httpHeader"):
+            hdr_end = data.find(b"\r\n\r\n")
+            if hdr_end >= 0:
+                return hdr_end + 4, "httpHeader"
+        return len(data), "initialUnknown"
 
     async def mark_pool_slot_failed(self, command: Dict[str, Any]) -> None:
         idx = int(command["poolIdx"])
@@ -2949,32 +3118,276 @@ class RuntimeWorld:
         io_resource_log(self.cfg, "runtime_mark_pool_slot_failed", pool_idx=idx, result="closing")
         await mark_slot_failure(self.state.pool, idx, slot_id, max_failures=1, log=self.log)
 
-    async def health_check_pool_slot(self, command: Dict[str, Any]) -> List[Dict[str, Any]]:
-        idx = int(command["poolIdx"])
-        slot_id = command.get("poolSlotId", "")
-        pool_op_id = str(command.get("poolOpId", "0"))
-        error = "health check executor unavailable in per-connection runtime world"
-        io_resource_log(self.cfg, "runtime_health_check_start", pool_idx=idx, pool_op_id=pool_op_id, result="unavailable", error=error)
-        return [{
-            "type": "poolSlotHealthCheckUnavailable",
-            "poolIdx": idx,
-            "poolSlotId": slot_id,
-            "poolOpId": pool_op_id,
-            "error": error,
-            "nowNanos": time.time_ns(),
-        }]
-
     async def reconnect_pool_slot(self, command: Dict[str, Any]) -> List[Dict[str, Any]]:
         idx = int(command["poolIdx"])
         pool_op_id = str(command.get("poolOpId", "0"))
         reason = command.get("reason", "")
-        io_resource_log(self.cfg, "runtime_reconnect_start", pool_idx=idx, pool_op_id=pool_op_id, reason=reason, result="unavailable")
+        io_resource_log(self.cfg, "runtime_reconnect_start", pool_idx=idx, pool_op_id=pool_op_id, reason=reason, result="started")
+        if self.state.pool is None:
+            io_resource_log(self.cfg, "runtime_reconnect_done", pool_idx=idx, pool_op_id=pool_op_id, reason=reason, result="error", error="pool unavailable")
+            return [{
+                "type": "poolSlotReconnectFailed",
+                "poolIdx": idx,
+                "poolOpId": pool_op_id,
+                "error": "pool unavailable",
+            }]
+        ok, detail = await reconnect_slot_once(self.cfg, self.state.pool, idx, self.log)
+        if ok:
+            io_resource_log(self.cfg, "runtime_reconnect_done", pool_idx=idx, pool_slot_id=detail, pool_op_id=pool_op_id, reason=reason, result="ok")
+            return [{
+                "type": "poolSlotReconnectOK",
+                "poolIdx": idx,
+                "poolSlotId": detail,
+                "poolOpId": pool_op_id,
+            }]
+        io_resource_log(self.cfg, "runtime_reconnect_done", pool_idx=idx, pool_op_id=pool_op_id, reason=reason, result="error", error=detail)
         return [{
             "type": "poolSlotReconnectFailed",
             "poolIdx": idx,
             "poolOpId": pool_op_id,
-            "error": "reconnect executor unavailable in py runtime world",
+            "error": detail,
         }]
+
+    async def install_pipe(self, command: Dict[str, Any]) -> List[Dict[str, Any]]:
+        token = command["token"]
+        client_handle = int(command["clientHandle"])
+        remote_handle = int(command["remoteHandle"])
+        client = self.handles.get(client_handle)
+        remote = self.handles.get(remote_handle)
+        fields = self.pipe_fields(command)
+        io_resource_log(self.cfg, "pipe_install_start", **fields, result="started")
+        if client is None or remote is None or client.reader is None or client.writer is None or remote.reader is None or remote.writer is None:
+            io_resource_log(self.cfg, "pipe_install_done", **fields, result="error", error="handle unavailable")
+            return [{
+                "type": "pipeInstallFailed",
+                "token": token,
+                "clientHandle": client_handle,
+                "remoteHandle": remote_handle,
+                "error": "handle unavailable",
+            }]
+        try:
+            await self.write_pipe_initial(command, client.writer, remote.writer)
+        except Exception as exc:
+            io_resource_log(self.cfg, "pipe_install_done", **fields, result="error", error=str(exc))
+            return [{
+                "type": "pipeInstallFailed",
+                "token": token,
+                "clientHandle": client_handle,
+                "remoteHandle": remote_handle,
+                "error": str(exc),
+            }]
+        io_resource_log(self.cfg, "pipe_install_done", **fields, result="ok")
+        await self.completions.put({
+            "type": "pipeInstalled",
+            "token": token,
+            "clientHandle": client_handle,
+            "remoteHandle": remote_handle,
+        })
+        task = asyncio.create_task(self.run_installed_pipe(command, client, remote))
+        self.tasks.add(task)
+        return []
+
+    async def write_pipe_initial(self, command: Dict[str, Any], client_writer: Any, remote_writer: Any) -> None:
+        initial = (command.get("initial") or {}).get("beforePipeWrites", []) or []
+        for idx, item in enumerate(initial):
+            dest = item.get("dest", "")
+            writer = remote_writer if dest == "remote" else client_writer
+            data = item.get("bytes", b"")
+            has_span = item.get("span") is not None
+            fields = self.pipe_fields(command)
+            fields.update({"initial_index": idx, "dest": dest, "has_span": has_span})
+            if isinstance(data, str):
+                data = data.encode("utf-8")
+            if has_span:
+                data = self.span_bytes(item["span"])
+                buffer = (item["span"].get("buffer") or {})
+                fields.update({
+                    "buffer_id": int(buffer.get("id", 0) or 0),
+                    "buffer_gen": int(buffer.get("gen", 0) or 0),
+                    "span_offset": int(item["span"].get("offset", 0) or 0),
+                    "span_len": int(item["span"].get("len", 0) or 0),
+                    "span_data_len": len(data) if data is not None else 0,
+                })
+                if data is None:
+                    io_resource_log(self.cfg, "pipe_initial_write", **fields, data_len=0, result="error", error="span unavailable")
+                    raise RuntimeError("span unavailable")
+            fields["data_len"] = len(data)
+            if not data:
+                io_resource_log(self.cfg, "pipe_initial_write", **fields, written=0, elapsed_nanos=0, result="skipped_empty")
+                continue
+            started = time.perf_counter_ns()
+            writer.write(data)
+            await writer.drain()
+            elapsed = time.perf_counter_ns() - started
+            if dest == "remote":
+                self.bytes_sent += len(data)
+            else:
+                self.bytes_received += len(data)
+            io_resource_log(self.cfg, "pipe_initial_write", **fields, written=len(data), elapsed_nanos=elapsed, result="ok")
+            if has_span:
+                self.release_buffer(item["span"].get("buffer"))
+
+    async def run_installed_pipe(self, command: Dict[str, Any], client: RuntimeHandleEntry, remote: RuntimeHandleEntry) -> None:
+        progress = {"up": 0, "down": 0}
+        reported = {"up": 0, "down": 0}
+        last_report_nanos = 0
+        first: Optional[str] = None
+        fields = self.pipe_fields(command)
+
+        async def report_progress(force: bool = False) -> None:
+            nonlocal last_report_nanos
+            if progress["up"] == reported["up"] and progress["down"] == reported["down"]:
+                return
+            now = time.time_ns()
+            if not force and last_report_nanos and now - last_report_nanos < NANO:
+                return
+            reported["up"] = progress["up"]
+            reported["down"] = progress["down"]
+            last_report_nanos = now
+            io_resource_log(
+                self.cfg,
+                "pipe_progress",
+                **fields,
+                bytes_up=reported["up"],
+                bytes_down=reported["down"],
+                result="reported",
+            )
+            await self.completions.put({
+                "type": "pipeProgress",
+                "token": command["token"],
+                "clientHandle": int(command["clientHandle"]),
+                "remoteHandle": int(command["remoteHandle"]),
+                "bytesUp": str(reported["up"]),
+                "bytesDown": str(reported["down"]),
+                "nowNanos": str(now),
+            })
+
+        async def direction_done(reason: str) -> None:
+            nonlocal first
+            if first is None:
+                first = reason
+
+        async def pump(direction: str, reader: Any, writer: Any, count_key: str) -> str:
+            io_resource_log(self.cfg, "pipe_direction_start", **fields, direction=direction, result="start")
+            total = 0
+            while True:
+                started = time.perf_counter_ns()
+                try:
+                    data = await reader.read(self.cfg.buffer_size)
+                    elapsed = time.perf_counter_ns() - started
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    elapsed = time.perf_counter_ns() - started
+                    if elapsed >= int(0.1 * NANO):
+                        io_resource_log(self.cfg, "pipe_stall", **fields, direction=direction, io_op="read", elapsed_nanos=elapsed)
+                    io_resource_log(self.cfg, "pipe_read", **fields, direction=direction, elapsed_nanos=elapsed, result="done", error=str(exc))
+                    reason = "clientError" if direction == "client" else "remoteError"
+                    io_resource_log(self.cfg, "pipe_direction_done", **fields, direction=direction, result=reason, bytes=total, error=str(exc))
+                    await direction_done(reason)
+                    return reason
+                if elapsed >= int(0.1 * NANO):
+                    io_resource_log(self.cfg, "pipe_stall", **fields, direction=direction, io_op="read", elapsed_nanos=elapsed)
+                if not data:
+                    io_resource_log(self.cfg, "pipe_read", **fields, direction=direction, elapsed_nanos=elapsed, result="done", error="EOF")
+                    await self.close_pipe_write(command, direction, writer)
+                    reason = "clientEOF" if direction == "client" else "remoteEOF"
+                    io_resource_log(self.cfg, "pipe_direction_done", **fields, direction=direction, result=reason, bytes=total)
+                    await direction_done(reason)
+                    return reason
+                io_resource_log(self.cfg, "pipe_read", **fields, direction=direction, bytes=len(data), elapsed_nanos=elapsed, result="done")
+                offset = 0
+                while offset < len(data):
+                    chunk = data[offset:]
+                    started = time.perf_counter_ns()
+                    try:
+                        writer.write(chunk)
+                        await writer.drain()
+                        elapsed = time.perf_counter_ns() - started
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        elapsed = time.perf_counter_ns() - started
+                        if elapsed >= int(0.1 * NANO):
+                            io_resource_log(self.cfg, "pipe_stall", **fields, direction=direction, io_op="write", elapsed_nanos=elapsed)
+                        io_resource_log(self.cfg, "pipe_write", **fields, direction=direction, elapsed_nanos=elapsed, result="done", error=str(exc))
+                        reason = "clientError" if direction == "client" else "remoteError"
+                        io_resource_log(self.cfg, "pipe_direction_done", **fields, direction=direction, result=reason, bytes=total, error=str(exc))
+                        await direction_done(reason)
+                        return reason
+                    written = len(chunk)
+                    offset += written
+                    total += written
+                    progress[count_key] += written
+                    if count_key == "up":
+                        self.bytes_sent += written
+                    else:
+                        self.bytes_received += written
+                    await report_progress(False)
+                    if elapsed >= int(0.1 * NANO):
+                        io_resource_log(self.cfg, "pipe_stall", **fields, direction=direction, io_op="write", elapsed_nanos=elapsed)
+                    io_resource_log(self.cfg, "pipe_write", **fields, direction=direction, bytes=written, elapsed_nanos=elapsed, result="done")
+
+        try:
+            remote_task = asyncio.create_task(pump("remote", remote.reader, client.writer, "down"))
+            client_task = asyncio.create_task(pump("client", client.reader, remote.writer, "up"))
+            done = await asyncio.gather(remote_task, client_task, return_exceptions=True)
+            reasons = []
+            for item in done:
+                if isinstance(item, BaseException):
+                    reasons.append("remoteError" if not reasons else "clientError")
+                else:
+                    reasons.append(str(item))
+            first_reason = first or (reasons[0] if reasons else "")
+            second_reason = ""
+            for reason in reasons:
+                if reason != first_reason:
+                    second_reason = reason
+                    break
+            if not second_reason and len(reasons) > 1:
+                second_reason = reasons[1]
+            await report_progress(True)
+            io_resource_log(
+                self.cfg,
+                "runtime_pipe_close",
+                **fields,
+                reason="bothDirectionsClosed",
+                result="requested",
+            )
+            io_resource_log(
+                self.cfg,
+                "pipe_closed",
+                **fields,
+                bytes_up=progress["up"],
+                bytes_down=progress["down"],
+                first=first_reason,
+                second=second_reason,
+                result="closed",
+            )
+            await self.completions.put({
+                "type": "pipeClosed",
+                "token": command["token"],
+                "clientHandle": int(command["clientHandle"]),
+                "remoteHandle": int(command["remoteHandle"]),
+                "reason": "bothDirectionsClosed",
+                "first": first_reason,
+                "second": second_reason,
+                "bytesUp": str(progress["up"]),
+                "bytesDown": str(progress["down"]),
+            })
+        except asyncio.CancelledError:
+            return
+
+    async def close_pipe_write(self, command: Dict[str, Any], direction: str, writer: Any) -> None:
+        fields = self.pipe_fields(command)
+        try:
+            if hasattr(writer, "can_write_eof") and not writer.can_write_eof():
+                io_resource_log(self.cfg, "pipe_close_write", **fields, direction=direction, result="ok")
+                return
+            writer.write_eof()
+            io_resource_log(self.cfg, "pipe_close_write", **fields, direction=direction, result="ok")
+        except Exception as exc:
+            io_resource_log(self.cfg, "pipe_close_write", **fields, direction=direction, result="error", error=str(exc))
 
     async def _ticker(self) -> None:
         try:
@@ -3007,6 +3420,151 @@ class RuntimeWorld:
             "op": _runtime_op_number(op),
             "op_label": _runtime_op_label(op),
         }
+
+    def pipe_fields(self, command: Dict[str, Any]) -> Dict[str, Any]:
+        fields = self.token_fields(command["token"])
+        fields.update({
+            "client_handle": int(command["clientHandle"]),
+            "remote_handle": int(command["remoteHandle"]),
+        })
+        remote = self.handles.get(int(command["remoteHandle"]))
+        if remote is not None and remote.pool_idx >= 0:
+            fields["pool_idx"] = remote.pool_idx
+            fields["pool_slot_id"] = remote.pool_slot_id
+        return fields
+
+
+class PoolControlWorld:
+    def __init__(
+        self,
+        cfg: Config,
+        state: ServerState,
+        log: logging.Logger,
+        shard_idx: int = 0,
+    ):
+        self.cfg = cfg
+        self.state = state
+        self.log = log
+        self.shard_idx = shard_idx
+        core_cfg = _runtime_config_from_cfg(cfg)
+        core_cfg["pool_control_enabled"] = (not cfg.local_only) and shard_idx == 0
+        core_cfg["pool_supervisor_enabled"] = (not cfg.local_only) and shard_idx == 0
+        self.core = RuntimeCore(core_cfg)
+        self.completions: asyncio.Queue = asyncio.Queue()
+        self.closed = False
+
+    async def run(self) -> None:
+        await self.feed({"type": "updateTime", "nowNanos": time.time_ns()})
+        ticker = asyncio.create_task(self._ticker())
+        try:
+            while not self.closed:
+                completion = await self.completions.get()
+                await self.feed(completion)
+        except asyncio.CancelledError:
+            pass
+        finally:
+            self.closed = True
+            ticker.cancel()
+            await asyncio.gather(ticker, return_exceptions=True)
+
+    async def feed(self, completion: Dict[str, Any]) -> None:
+        commands = self.core.step(completion)
+        while commands:
+            more: List[Dict[str, Any]] = []
+            for command in commands:
+                more.extend(await self.execute_command(command))
+            commands = []
+            for item in more:
+                commands.extend(self.core.step(item))
+
+    async def execute_command(self, command: Dict[str, Any]) -> List[Dict[str, Any]]:
+        ctype = command["type"]
+        if ctype == "markPoolSlotFailed":
+            await self.mark_pool_slot_failed(command)
+        elif ctype == "reconnectPoolSlot":
+            return await self.reconnect_pool_slot(command)
+        return []
+
+    async def mark_pool_slot_failed(self, command: Dict[str, Any]) -> None:
+        idx = int(command["poolIdx"])
+        slot_id = command.get("poolSlotId", "")
+        io_resource_log(
+            self.cfg,
+            "runtime_mark_pool_slot_failed",
+            pool_idx=idx,
+            pool_slot_id=slot_id,
+            result="closing",
+        )
+        await mark_slot_failure(self.state.pool, idx, slot_id, max_failures=1, log=self.log)
+
+    async def reconnect_pool_slot(self, command: Dict[str, Any]) -> List[Dict[str, Any]]:
+        idx = int(command["poolIdx"])
+        pool_op_id = str(command.get("poolOpId", "0"))
+        reason = command.get("reason", "")
+        io_resource_log(
+            self.cfg,
+            "runtime_reconnect_start",
+            pool_idx=idx,
+            pool_op_id=pool_op_id,
+            reason=reason,
+            result="started",
+        )
+        if self.state.pool is None:
+            io_resource_log(
+                self.cfg,
+                "runtime_reconnect_done",
+                pool_idx=idx,
+                pool_op_id=pool_op_id,
+                reason=reason,
+                result="error",
+                error="pool unavailable",
+            )
+            return [{
+                "type": "poolSlotReconnectFailed",
+                "poolIdx": idx,
+                "poolOpId": pool_op_id,
+                "error": "pool unavailable",
+            }]
+        ok, detail = await reconnect_slot_once(self.cfg, self.state.pool, idx, self.log)
+        if ok:
+            io_resource_log(
+                self.cfg,
+                "runtime_reconnect_done",
+                pool_idx=idx,
+                pool_slot_id=detail,
+                pool_op_id=pool_op_id,
+                reason=reason,
+                result="ok",
+            )
+            return [{
+                "type": "poolSlotReconnectOK",
+                "poolIdx": idx,
+                "poolSlotId": detail,
+                "poolOpId": pool_op_id,
+            }]
+        io_resource_log(
+            self.cfg,
+            "runtime_reconnect_done",
+            pool_idx=idx,
+            pool_op_id=pool_op_id,
+            reason=reason,
+            result="error",
+            error=detail,
+        )
+        return [{
+            "type": "poolSlotReconnectFailed",
+            "poolIdx": idx,
+            "poolOpId": pool_op_id,
+            "error": detail,
+        }]
+
+    async def _ticker(self) -> None:
+        try:
+            while not self.closed:
+                await asyncio.sleep(1.0)
+                await self.completions.put({"type": "tick", "nowNanos": time.time_ns()})
+        except asyncio.CancelledError:
+            return
 
 
 def _runtime_op_number(op: str) -> int:
@@ -3047,7 +3605,6 @@ def _runtime_config_from_cfg(cfg: Config) -> Dict[str, Any]:
         "pool_acquire_retry_interval_nanos": 100_000_000,
         "max_sessions_per_slot": cfg.max_sessions,
         "slot_cooldown_nanos": int(cfg.slot_cooldown_after_failure * NANO),
-        "pool_health_check_interval_nanos": int(cfg.health_check_interval * NANO),
         "pool_reconnect_interval_nanos": int(cfg.retry_delay * NANO),
         "pool_max_health_failures": cfg.max_consecutive_failures,
         "pool_supervisor_enabled": False,
@@ -3683,6 +4240,28 @@ class _FakeAsyncStreamReader:
         return b""
 
 
+class _FakeSSHConnection:
+    def __init__(self):
+        self.closed = False
+        self.close_calls = 0
+
+    def is_closed(self):
+        return self.closed
+
+    def close(self):
+        self.closed = True
+        self.close_calls += 1
+
+    async def wait_closed(self):
+        return None
+
+
+class _FakePoolControl:
+    def __init__(self, shard_idx: int = 0):
+        self.shard_idx = shard_idx
+        self.completions: asyncio.Queue = asyncio.Queue()
+
+
 async def _run_runtime_tests_async():
     print("\nRunning runtime adapter tests...")
     passed = 0
@@ -3754,6 +4333,9 @@ async def _run_runtime_tests_async():
     # ------------------------------------------------------------------
 
     log = logging.getLogger("SSHProxy.test.runtime")
+    log.handlers.clear()
+    log.addHandler(logging.NullHandler())
+    log.propagate = False
     server_state = ServerState(pool=init_pool_state(0))
     peer = ("127.0.0.1", 12345)
 
@@ -3900,6 +4482,43 @@ async def _run_runtime_tests_async():
         validate_config(local_cfg) == [],
     )
 
+    failure_records = []
+
+    class _CaptureHandler(logging.Handler):
+        def emit(self, record):
+            failure_records.append(record)
+
+    failure_log = logging.getLogger("SSHProxy.test.runtime.failures")
+    failure_log.handlers.clear()
+    failure_log.setLevel(logging.DEBUG)
+    failure_log.addHandler(_CaptureHandler())
+    failure_log.propagate = False
+    failure_log_state = ServerState(pool=init_pool_state(0))
+    failure_log_world = RuntimeWorld(
+        local_cfg,
+        failure_log_state,
+        failure_log,
+        _FakeAsyncStreamReader([]),
+        _FakeAsyncStreamWriter(),
+    )
+    await failure_log_world.execute_command({
+        "type": "logWriteFailure",
+        "text": "write client: Connection lost, phase=PIPING, pipe=HALF_CLOSED_CLIENT",
+    })
+    await failure_log_world.execute_command({
+        "type": "logSessionFailed",
+        "text": "session failed: reason=write client: Connection lost, phase=PIPING, pipe=HALF_CLOSED_CLIENT",
+    })
+    await failure_log_world.execute_command({
+        "type": "logIOFailure",
+        "text": "read remote: upstream closed",
+    })
+    check("runtime failure logs still count as errors", failure_log_state.stats.errors == 3)
+    check(
+        "runtime failure logs are debug-level",
+        len(failure_records) == 3 and all(r.levelno == logging.DEBUG for r in failure_records),
+    )
+
     verbose_cfg = replace(local_cfg, verbose=True)
     capture = io.StringIO()
     with contextlib.redirect_stderr(capture):
@@ -3938,6 +4557,13 @@ async def _run_runtime_tests_async():
     ssh_runtime_cfg = _runtime_config_from_cfg(replace(local_cfg, local_only=False))
     check("per-connection runtime core disables pool supervisor", ssh_runtime_cfg["pool_supervisor_enabled"] is False)
 
+    snap_pool = init_pool_state(2)
+    async with snap_pool.lock:
+        snap_pool.slots[1] = PoolSlot(conn=_FakeSSHConnection())
+    snap = snapshot_slots(snap_pool.slots)
+    check("snapshot keeps disconnected slot visible", snap[0] is not None and snap[0].is_connected is False)
+    check("snapshot keeps connected slot visible", snap[1] is not None and snap[1].is_connected is True)
+
     shard_state = ServerState(pool=init_pool_state(0))
     shard_state.shard_queues = [asyncio.Queue() for _ in range(4)]
     shard_reader = _FakeAsyncStreamReader([])
@@ -3975,6 +4601,196 @@ async def _run_runtime_tests_async():
     world_log_lines = [line for line in world_capture.getvalue().splitlines() if "\"type\":\"io_resource\"" in line]
     check("runtime world emits io_resource logs", any("\"event\":\"runtime_read_start\"" in line for line in world_log_lines))
     check("runtime world writes CONNECT success response", any(b"200 Connection Established" in chunk for chunk in client_writer.buffer))
+
+    fast_req = (
+        f"CONNECT 127.0.0.1:{port} HTTP/1.1\r\n"
+        f"Host: 127.0.0.1:{port}\r\n\r\n"
+    ).encode("ascii")
+    fast_client_reader = _FakeAsyncStreamReader([fast_req + b"HELLO", b"CLIENT2", b""])
+    fast_client_writer = _FakeAsyncStreamWriter(local_addr=("127.0.0.1", 1082), peer_addr=("127.0.0.1", 34568))
+    fast_remote_reader = _FakeAsyncStreamReader([b"REMOTE1", b""])
+    fast_remote_writer = _FakeAsyncStreamWriter(local_addr=("127.0.0.1", 50001), peer_addr=("127.0.0.1", port))
+    fast_capture = io.StringIO()
+
+    async def fake_open_connection_fast(open_host, open_port):
+        if open_host != host or int(open_port) != port:
+            raise RuntimeError(f"unexpected dial {open_host}:{open_port}")
+        return fast_remote_reader, fast_remote_writer
+
+    try:
+        asyncio.open_connection = fake_open_connection_fast
+        with contextlib.redirect_stderr(fast_capture):
+            fast_world = RuntimeWorld(world_cfg, ServerState(pool=init_pool_state(0)), world_log, fast_client_reader, fast_client_writer)
+            await asyncio.wait_for(fast_world.run(), timeout=5.0)
+    finally:
+        asyncio.open_connection = original_open_connection
+    fast_log_lines = [line for line in fast_capture.getvalue().splitlines() if "\"type\":\"io_resource\"" in line]
+    check("runtime world installPipe logs install start", any("\"event\":\"pipe_install_start\"" in line for line in fast_log_lines))
+    check("runtime world installPipe logs initial write", any("\"event\":\"pipe_initial_write\"" in line for line in fast_log_lines))
+    check("runtime world installPipe logs direction start", any("\"event\":\"pipe_direction_start\"" in line for line in fast_log_lines))
+    check("runtime world installPipe logs pipe reads", any("\"event\":\"pipe_read\"" in line for line in fast_log_lines))
+    check("runtime world installPipe logs pipe writes", any("\"event\":\"pipe_write\"" in line for line in fast_log_lines))
+    check("runtime world installPipe writes initial response", any(b"200 Connection Established" in chunk for chunk in fast_client_writer.buffer))
+    check("runtime world installPipe writes initial tail span", any(chunk == b"HELLO" for chunk in fast_remote_writer.buffer))
+    check("runtime world installPipe pumps client data", any(chunk == b"CLIENT2" for chunk in fast_remote_writer.buffer))
+    check("runtime world installPipe pumps remote data", any(chunk == b"REMOTE1" for chunk in fast_client_writer.buffer))
+    check("runtime world installPipe reports close-write", any("\"event\":\"pipe_close_write\"" in line for line in fast_log_lines))
+    check("runtime world installPipe reports direction done", any("\"event\":\"pipe_direction_done\"" in line for line in fast_log_lines))
+    check("runtime world installPipe reports progress", any("\"event\":\"pipe_progress\"" in line for line in fast_log_lines))
+    check("runtime world installPipe reports runtime pipe close", any("\"event\":\"runtime_pipe_close\"" in line for line in fast_log_lines))
+    check("runtime world installPipe reports pipe closed", any("\"event\":\"pipe_closed\"" in line for line in fast_log_lines))
+
+    socks_greeting = bytes.fromhex("050100")
+    socks_request = bytes([0x05, 0x01, 0x00, 0x01, 127, 0, 0, 1, (port >> 8) & 0xff, port & 0xff])
+    socks_client_reader = _FakeAsyncStreamReader([socks_greeting, socks_request, b"CLIENT2", b""])
+    socks_client_writer = _FakeAsyncStreamWriter(local_addr=("127.0.0.1", 1084), peer_addr=("127.0.0.1", 34569))
+    socks_remote_reader = _FakeAsyncStreamReader([b"REMOTE1", b""])
+    socks_remote_writer = _FakeAsyncStreamWriter(local_addr=("127.0.0.1", 50002), peer_addr=("127.0.0.1", port))
+    socks_capture = io.StringIO()
+
+    async def fake_open_connection_socks(open_host, open_port):
+        if open_host != host or int(open_port) != port:
+            raise RuntimeError(f"unexpected dial {open_host}:{open_port}")
+        return socks_remote_reader, socks_remote_writer
+
+    try:
+        asyncio.open_connection = fake_open_connection_socks
+        with contextlib.redirect_stderr(socks_capture):
+            socks_world = RuntimeWorld(world_cfg, ServerState(pool=init_pool_state(0)), world_log, socks_client_reader, socks_client_writer)
+            await asyncio.wait_for(socks_world.run(), timeout=5.0)
+    finally:
+        asyncio.open_connection = original_open_connection
+    socks_log_lines = [line for line in socks_capture.getvalue().splitlines() if "\"type\":\"io_resource\"" in line]
+    check("runtime world SOCKS installPipe logs install start", any("\"event\":\"pipe_install_start\"" in line for line in socks_log_lines))
+    check("runtime world SOCKS request reaches remote via pipe", any(chunk == b"CLIENT2" for chunk in socks_remote_writer.buffer))
+    check("runtime world SOCKS remote data reaches client", any(chunk == b"REMOTE1" for chunk in socks_client_writer.buffer))
+    check("runtime world SOCKS auth reply written", any(chunk == b"\x05\x00" for chunk in socks_client_writer.buffer))
+    check("runtime world SOCKS connect reply written", any(chunk == socks5_reply(0x00) for chunk in socks_client_writer.buffer))
+
+    reconnect_state = ServerState(pool=init_pool_state(1))
+    reconnect_cfg = replace(world_cfg, local_only=False, verbose=False)
+    reconnect_log = logging.getLogger("SSHProxy.test.reconnect")
+    original_create_ssh_connection = globals()["create_ssh_connection"]
+
+    async def fake_create_ssh_connection(_cfg):
+        return _FakeSSHConnection()
+
+    try:
+        globals()["create_ssh_connection"] = fake_create_ssh_connection
+        reconnect_world = RuntimeWorld(
+            reconnect_cfg,
+            reconnect_state,
+            reconnect_log,
+            _FakeAsyncStreamReader([]),
+            _FakeAsyncStreamWriter(),
+        )
+        reconnect_result = await reconnect_world.reconnect_pool_slot({
+            "type": "reconnectPoolSlot",
+            "poolIdx": 0,
+            "poolOpId": "1",
+            "reason": "test reconnect",
+        })
+    finally:
+        globals()["create_ssh_connection"] = original_create_ssh_connection
+    async with reconnect_state.pool.lock:
+        reconnected_slot = reconnect_state.pool.slots[0]
+    check("runtime reconnect returns OK completion", reconnect_result and reconnect_result[0]["type"] == "poolSlotReconnectOK")
+    check("runtime reconnect installs new SSH slot", reconnected_slot is not None and reconnected_slot.conn is not None)
+
+    reconnect_state_2 = ServerState(pool=init_pool_state(1))
+    reconnect_calls = 0
+    release_reconnect = asyncio.Event()
+
+    async def fake_slow_create_ssh_connection(_cfg):
+        nonlocal reconnect_calls
+        reconnect_calls += 1
+        await release_reconnect.wait()
+        return _FakeSSHConnection()
+
+    try:
+        globals()["create_ssh_connection"] = fake_slow_create_ssh_connection
+        worlds = [
+            RuntimeWorld(
+                reconnect_cfg,
+                reconnect_state_2,
+                reconnect_log,
+                _FakeAsyncStreamReader([]),
+                _FakeAsyncStreamWriter(),
+            )
+            for _ in range(6)
+        ]
+        reconnect_tasks = [
+            asyncio.create_task(world.reconnect_pool_slot({
+                "type": "reconnectPoolSlot",
+                "poolIdx": 0,
+                "poolOpId": str(i + 10),
+                "reason": "concurrent reconnect",
+            }))
+            for i, world in enumerate(worlds)
+        ]
+        await asyncio.sleep(0)
+        release_reconnect.set()
+        reconnect_results = await asyncio.gather(*reconnect_tasks)
+    finally:
+        globals()["create_ssh_connection"] = original_create_ssh_connection
+    check("runtime reconnect coalesces same slot dials", reconnect_calls == 1)
+    check(
+        "runtime reconnect waiters receive OK completion",
+        all(result and result[0]["type"] == "poolSlotReconnectOK" for result in reconnect_results),
+    )
+
+    wake_state = ServerState(pool=init_pool_state(2))
+    wake_state.shard_queues = [asyncio.Queue() for _ in range(4)]
+    wake_state.pool_control = _FakePoolControl()
+    async with wake_state.pool.lock:
+        wake_state.pool.slots[0] = PoolSlot(conn=_FakeSSHConnection())
+        wake_state.pool.slots[1] = PoolSlot(conn=_FakeSSHConnection())
+    await deliver_system_wake_to_shard0(
+        replace(reconnect_cfg, verbose=True),
+        wake_state,
+        reconnect_log,
+        61.0,
+    )
+    wake_completion = await wake_state.pool_control.completions.get()
+    check(
+        "system wake delivered only to shard0 pool control",
+        wake_completion["type"] == "systemWake"
+        and wake_state.pool_control.shard_idx == 0
+        and all(q.qsize() == 0 for q in wake_state.shard_queues),
+    )
+    check(
+        "system wake carries pool snapshot",
+        len(wake_completion.get("poolViews", [])) == 2
+        and all(view.get("isConnected") for view in wake_completion["poolViews"]),
+    )
+
+    wake_reconnect_state = ServerState(pool=init_pool_state(2))
+    async with wake_reconnect_state.pool.lock:
+        wake_reconnect_state.pool.slots[0] = PoolSlot(conn=_FakeSSHConnection())
+        wake_reconnect_state.pool.slots[1] = PoolSlot(conn=_FakeSSHConnection())
+    wake_reconnect_world = PoolControlWorld(reconnect_cfg, wake_reconnect_state, reconnect_log, shard_idx=0)
+    wake_reconnect_calls = 0
+
+    async def fake_wake_create_ssh_connection(_cfg):
+        nonlocal wake_reconnect_calls
+        wake_reconnect_calls += 1
+        return _FakeSSHConnection()
+
+    try:
+        globals()["create_ssh_connection"] = fake_wake_create_ssh_connection
+        await wake_reconnect_world.feed({
+            "type": "systemWake",
+            "nowNanos": time.time_ns(),
+            "sleptNanos": int(61.0 * NANO),
+            "poolViews": [
+                _pool_view_to_core_dict(view)
+                for view in snapshot_slots(wake_reconnect_state.pool.slots)
+                if view is not None
+            ],
+        })
+    finally:
+        globals()["create_ssh_connection"] = original_create_ssh_connection
+    check("shard0 pool control reconnects wake slots", wake_reconnect_calls == 2)
 
     print(f"\nRuntime test results: {passed} passed, {failed} failed")
     return failed == 0
@@ -4095,13 +4911,6 @@ def _run_pool_decision_tests():
 
     check("apply_success: resets to 0", apply_slot_success(5) == 0)
     check("apply_success: already 0", apply_slot_success(0) == 0)
-
-    # -- should_watcher_reconnect -----------ProxyProtocolState------------------------------
-
-    check("watcher: below → no",
-          not should_watcher_reconnect(1, 3))
-    check("watcher: at threshold → yes",
-          should_watcher_reconnect(3, 3))
 
     print(f"\nPool decision test results: {passed} passed, {failed} failed")
     return failed == 0
@@ -4513,7 +5322,39 @@ def _run_json_test_vectors() -> bool:
         "normalizePprofConfig": lambda i: normalize_pprof_config(bool(i["enabled"]), i["addr"]),
         "normalizeEventLoopShardCount": lambda i: normalize_event_loop_shard_count(int(i["requested"]), int(i["cpu_count"])),
         "computeShardIndex": lambda i: compute_shard_index(int(i["key"]), int(i["shard_count"])),
-        "assignAcceptShard": lambda i: assign_accept_shard(i["remote_addr"], int(i["sequence"]), int(i["shard_count"])),
+        "assignAcceptShard": lambda i: {
+            "deterministic": assign_accept_shard(
+                i["remote_addr"], int(i["sequence"]), int(i["shard_count"])
+            )
+            == assign_accept_shard(
+                i["remote_addr"], int(i["sequence"]), int(i["shard_count"])
+            ),
+            "differs_by_remote_addr": assign_accept_shard(
+                i["remote_addr"], int(i["sequence"]), int(i["shard_count"])
+            )
+            != assign_accept_shard(
+                i["remote_addr_variant"], int(i["sequence"]), int(i["shard_count"])
+            ),
+            "differs_by_sequence_number": assign_accept_shard(
+                i["remote_addr"], int(i["sequence"]), int(i["shard_count"])
+            )
+            != assign_accept_shard(
+                i["remote_addr"], int(i["sequence_variant"]), int(i["shard_count"])
+            ),
+            "result_in_range": 0
+            <= assign_accept_shard(
+                i["remote_addr"], int(i["sequence"]), int(i["shard_count"])
+            )
+            < int(i["shard_count"]),
+            "single_shard_returns_zero": assign_accept_shard(
+                i["remote_addr"], int(i["sequence"]), 1
+            )
+            == 0,
+            "zero_shards_returns_zero": assign_accept_shard(
+                i["remote_addr"], int(i["sequence"]), 0
+            )
+            == 0,
+        },
         "hashShardKey": lambda i: {
             "deterministic": hash_shard_key(i["remote_addr"], int(i["sequence"])) == hash_shard_key(i["remote_addr"], int(i["sequence"])),
             "differs_by_remote_addr": hash_shard_key(i["remote_addr"], int(i["sequence"])) != hash_shard_key(i["remote_addr_variant"], int(i["sequence"])),
@@ -4551,6 +5392,18 @@ def _seconds(value: float) -> int:
     return int(round(float(value) * NANO))
 
 
+def _pipe_close_fact_text(fact: Optional[str]) -> str:
+    if fact == "clientEOF":
+        return "client read eof"
+    if fact == "remoteEOF":
+        return "remote read eof"
+    if fact == "clientError":
+        return "client read error"
+    if fact == "remoteError":
+        return "remote read error"
+    return fact or ""
+
+
 @dataclass
 class CorePoolSlot:
     slot_id: str = ""
@@ -4559,11 +5412,8 @@ class CorePoolSlot:
     usage: int = 0
     consecutive_failures: int = 0
     last_failure_nanos: int = 0
-    next_health_check_nanos: int = 0
     next_reconnect_nanos: int = 0
-    health_check_in_flight: bool = False
     reconnect_in_flight: bool = False
-    health_check_op_id: int = 0
     reconnect_op_id: int = 0
 
 
@@ -4582,6 +5432,10 @@ class CoreSession:
     target_host: str = ""
     target_port: int = 0
     buffer: bytes = b""
+    pending_client_spans: List[Dict[str, Any]] = field(default_factory=list)
+    fast_pipe_eligible: bool = False
+    pipe_base_sent: int = 0
+    pipe_base_received: int = 0
     pending_client_writes: List[Dict[str, Any]] = field(default_factory=list)
     pending_remote_writes: List[Dict[str, Any]] = field(default_factory=list)
     read_in_flight_client: bool = False
@@ -4628,10 +5482,10 @@ class RuntimeCore:
             "slot_cooldown_nanos": 1 * NANO,
             "pool_supervisor_enabled": True,
             "pool_control_enabled": True,
-            "pool_health_check_interval_nanos": 3 * NANO,
             "pool_reconnect_interval_nanos": 3 * NANO,
             "pool_max_health_failures": 3,
             "max_connect_attempts": 3,
+            "install_pipe_enabled": True,
         }
         self.cfg.update(config)
         self.sessions = [CoreSession() for _ in range(self.cfg["max_sessions"])]
@@ -4653,33 +5507,11 @@ class RuntimeCore:
             self.current_now_nanos = int(completion["nowNanos"])
             self._tick(commands)
             return commands
-        if ctype == "poolSupervisorSnapshot":
-            self._pool_supervisor_snapshot(completion.get("poolViews", []))
-            self._retry_waiting_pool_acquires(commands)
-            return commands
         if ctype == "systemWake":
             self.current_now_nanos = int(completion["nowNanos"])
             views = completion.get("poolViews", [])
-            self._pool_supervisor_snapshot(views)
+            self._merge_pool_resource_views(views)
             self._system_wake(views, int(completion["sleptNanos"]), commands)
-            return commands
-        if ctype == "poolSlotHealthCheckFailed":
-            self._pool_slot_health_check_failed(
-                int(completion["poolIdx"]),
-                completion.get("poolSlotId", ""),
-                int(completion.get("poolOpId", 0) or 0),
-                completion.get("error", ""),
-                commands,
-            )
-            return commands
-        if ctype == "poolSlotHealthCheckUnavailable":
-            if "nowNanos" in completion and completion["nowNanos"] is not None:
-                self.current_now_nanos = int(completion["nowNanos"])
-            self._pool_slot_health_check_unavailable(
-                int(completion["poolIdx"]),
-                completion.get("poolSlotId", ""),
-                int(completion.get("poolOpId", 0) or 0),
-            )
             return commands
         if ctype == "poolSlotProgress":
             if "nowNanos" in completion and completion["nowNanos"] is not None:
@@ -4691,14 +5523,12 @@ class RuntimeCore:
             self._pool_slot_reconnect_ok(
                 int(completion["poolIdx"]),
                 completion.get("poolSlotId", ""),
-                int(completion.get("poolOpId", 0) or 0),
             )
             self._retry_waiting_pool_acquires(commands)
             return commands
         if ctype == "poolSlotReconnectFailed":
             self._pool_slot_reconnect_failed(
                 int(completion["poolIdx"]),
-                int(completion.get("poolOpId", 0) or 0),
             )
             return commands
 
@@ -4713,7 +5543,9 @@ class RuntimeCore:
             self._release_stale_completion(completion, commands)
             return commands
 
-        if ctype == "readDone":
+        if ctype == "readFrame":
+            self._read_frame(sid, session, completion, commands)
+        elif ctype == "readDone":
             self._read_done(sid, session, completion, commands)
         elif ctype == "readEOF":
             source = completion["source"]
@@ -4744,6 +5576,14 @@ class RuntimeCore:
             self._dial_failed(sid, session, completion, commands)
         elif ctype == "poolSnapshot":
             self._pool_snapshot(sid, session, completion.get("poolViews", []), commands)
+        elif ctype == "pipeInstalled":
+            self._pipe_installed(session)
+        elif ctype == "pipeInstallFailed":
+            self._fail_session(sid, session, f"pipe install failed: {completion.get('error', '')}", commands)
+        elif ctype == "pipeProgress":
+            self._pipe_progress(session, completion)
+        elif ctype == "pipeClosed":
+            self._pipe_closed(sid, session, completion, commands)
         return commands
 
     def first_session(self) -> Optional[CoreSession]:
@@ -4783,6 +5623,32 @@ class RuntimeCore:
             self._read_protocol_bytes(sid, session, data, commands)
             if completion.get("payload") is not None:
                 commands.append({"type": "releasePayload", "payload": completion["payload"]})
+        self._after_read_completion(sid, session, source, commands)
+
+    def _read_frame(self, sid: int, session: CoreSession, completion: Dict[str, Any], commands: List[Dict[str, Any]]) -> None:
+        source = completion["source"]
+        self._finish_read(session, source)
+        frame = completion.get("frame") or {}
+        raw_len = int(frame.get("rawLen", frame.get("raw_len", 0)) or 0)
+        raw_offset = int(frame.get("rawOffset", frame.get("raw_offset", 0)) or 0)
+        buffer_ref = frame.get("buffer") or {}
+        span = None
+        if raw_len > 0 and buffer_ref:
+            span = {"buffer": buffer_ref, "offset": raw_offset, "len": raw_len}
+        if session.phase == "piping" and completion.get("frameKind") == "opaqueData":
+            if span is None:
+                commands.append({"type": "releaseBuffer", "buffer": buffer_ref})
+            else:
+                self._pipe_span(sid, session, source, span, commands)
+            self._after_read_completion(sid, session, source, commands)
+            return
+        self._read_protocol_bytes(sid, session, completion.get("protocolBytes", b""), commands)
+        if span is not None:
+            session.fast_pipe_eligible = True
+        if span is not None and source == "client" and session.phase in ("connecting", "piping"):
+            session.pending_client_spans.append(span)
+        elif buffer_ref:
+            commands.append({"type": "releaseBuffer", "buffer": buffer_ref})
         self._after_read_completion(sid, session, source, commands)
 
     def _read_protocol_bytes(self, sid: int, session: CoreSession, data: bytes, commands: List[Dict[str, Any]]) -> None:
@@ -4878,6 +5744,38 @@ class RuntimeCore:
         elif session.mode == "httpProxy":
             explicit_remote = b""
         self._enter_piping(session)
+        if self.cfg["install_pipe_enabled"] and session.mode in ("httpConnect", "socks"):
+            initial = []
+            if explicit_client:
+                initial.append({"dest": "client", "bytes": explicit_client})
+            if explicit_remote:
+                initial.append({"dest": "remote", "bytes": explicit_remote})
+            for span in session.pending_client_spans:
+                initial.append({"dest": "remote", "span": span})
+                session.bytes_sent += int(span.get("len", 0))
+            session.pending_client_spans = []
+            if session.buffer:
+                initial.append({"dest": "remote", "bytes": session.buffer})
+                session.bytes_sent += len(session.buffer)
+                session.buffer = b""
+            session.phase = "pipeInstalling"
+            session.pipe_base_sent = session.bytes_sent
+            session.pipe_base_received = session.bytes_received
+            commands.append({
+                "type": "installPipe",
+                "session": sid,
+                "token": self._token(sid, session, "pipe"),
+                "clientHandle": session.local_handle,
+                "remoteHandle": session.remote_handle,
+                "mode": session.mode,
+                "policy": {
+                    "halfClose": "propagate",
+                    "closeOnBothEOF": True,
+                    "idleTimeoutNanos": str(self.cfg["pipe_idle_timeout_nanos"]),
+                },
+                "initial": {"beforePipeWrites": initial} if initial else None,
+            })
+            return
         if explicit_client:
             self._enqueue_write(sid, session, self._write_cmd(sid, session, "client", explicit_client), commands)
         if explicit_remote:
@@ -4933,7 +5831,7 @@ class RuntimeCore:
     def _tick(self, commands: List[Dict[str, Any]]) -> None:
         if self.current_now_nanos <= 0:
             return
-        self._tick_pool_supervisor(commands)
+        self._tick_pool_reconnects(commands)
         for sid, session in enumerate(self.sessions):
             self._tick_session(sid, session, commands)
 
@@ -4986,6 +5884,36 @@ class RuntimeCore:
             session.bytes_received += len(data)
             self._mark_progress(session, upload=False, download=True)
             self._enqueue_write(sid, session, self._write_cmd(sid, session, "client", data, payload), commands)
+
+    def _pipe_span(self, sid: int, session: CoreSession, source: str, span: Dict[str, Any], commands: List[Dict[str, Any]]) -> None:
+        if source == "client":
+            if session.pipe_stage in ("halfClosedClient", "closed"):
+                commands.append({"type": "releaseBuffer", "buffer": span["buffer"]})
+                return
+            session.bytes_sent += int(span.get("len", 0))
+            self._mark_progress(session, upload=True, download=False)
+            commands.append({
+                "type": "writeSpan",
+                "session": sid,
+                "token": self._token(sid, session, "writeRemote"),
+                "handle": session.remote_handle,
+                "dest": "remote",
+                "span": span,
+            })
+        else:
+            if session.pipe_stage in ("halfClosedRemote", "closed"):
+                commands.append({"type": "releaseBuffer", "buffer": span["buffer"]})
+                return
+            session.bytes_received += int(span.get("len", 0))
+            self._mark_progress(session, upload=False, download=True)
+            commands.append({
+                "type": "writeSpan",
+                "session": sid,
+                "token": self._token(sid, session, "writeClient"),
+                "handle": session.local_handle,
+                "dest": "client",
+                "span": span,
+            })
 
     def _write_cmd(self, sid: int, session: CoreSession, dest: str, data: bytes, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         cmd = {
@@ -5056,6 +5984,8 @@ class RuntimeCore:
         err = completion.get("error", "")
         if self._write_failure_is_normal_drain(session):
             pass
+        elif self._client_write_failure_is_normal_close(session, dest):
+            self._done_session(sid, session, "client write failed after client eof", commands)
         elif dest == "remote" and self._remote_write_eof_is_session_done(session, err):
             self._record_pipe_close_reason(session, "client", "read eof")
             session.pipe_stage = "closed"
@@ -5148,7 +6078,18 @@ class RuntimeCore:
             if session.read_in_flight_client:
                 return
             session.read_in_flight_client = True
-            commands.append({"type": "read", "session": sid, "token": self._token(sid, session, "readClient"), "handle": session.local_handle, "source": "client", "frameMode": "detectInitial"})
+            commands.append({"type": "read", "session": sid, "token": self._token(sid, session, "readClient"), "handle": session.local_handle, "source": "client", "frameMode": self._client_frame_mode(session)})
+
+    def _client_frame_mode(self, session: CoreSession) -> str:
+        if session.phase == "socksAuth":
+            return "socksGreeting"
+        if session.phase == "socksReq":
+            return "socksRequest"
+        if session.phase == "httpReq":
+            return "httpHeader"
+        if session.phase == "piping":
+            return "opaquePipe"
+        return "detectInitial"
 
     def _can_read(self, session: CoreSession, source: str) -> bool:
         if not session.active or session.draining or session.phase == "closed":
@@ -5182,6 +6123,60 @@ class RuntimeCore:
         session.last_recv_progress_nanos = self.current_now_nanos
         session.last_stall_warning_nanos = 0
         session.last_download_stall_warning_nanos = 0
+
+    def _pipe_installed(self, session: CoreSession) -> None:
+        if not session.active or session.phase == "closed":
+            return
+        session.phase = "piping"
+        if session.pipe_base_sent == 0 and session.pipe_base_received == 0:
+            session.pipe_base_sent = session.bytes_sent
+            session.pipe_base_received = session.bytes_received
+        session.read_in_flight_client = False
+        session.read_in_flight_remote = False
+        session.write_in_flight_client = False
+        session.write_in_flight_remote = False
+        session.write_client_active_bytes = 0
+        session.write_remote_active_bytes = 0
+
+    def _pipe_progress(self, session: CoreSession, completion: Dict[str, Any]) -> None:
+        if not session.active or session.phase not in ("pipeInstalling", "piping"):
+            return
+        if completion.get("nowNanos") is not None:
+            self.current_now_nanos = int(completion["nowNanos"])
+        up = session.pipe_base_sent + int(completion.get("bytesUp", 0))
+        down = session.pipe_base_received + int(completion.get("bytesDown", 0))
+        up_advanced = up > session.bytes_sent
+        down_advanced = down > session.bytes_received
+        if up_advanced:
+            session.bytes_sent = up
+        if down_advanced:
+            session.bytes_received = down
+        if up_advanced or down_advanced:
+            session.pipe_idle_deadline_nanos = self.current_now_nanos + self.cfg["pipe_idle_timeout_nanos"] if self.current_now_nanos > 0 else 0
+            self._mark_progress(session, upload=up_advanced, download=down_advanced)
+
+    def _pipe_closed(self, sid: int, session: CoreSession, completion: Dict[str, Any], commands: List[Dict[str, Any]]) -> None:
+        up = session.pipe_base_sent + int(completion.get("bytesUp", 0))
+        down = session.pipe_base_received + int(completion.get("bytesDown", 0))
+        if up > session.bytes_sent:
+            session.bytes_sent = up
+        if down > session.bytes_received:
+            session.bytes_received = down
+        session.pipe_stage = "closed"
+        reason = completion.get("reason", "bothDirectionsClosed")
+        if reason == "bothDirectionsClosed":
+            first = _pipe_close_fact_text(completion.get("first"))
+            second = _pipe_close_fact_text(completion.get("second"))
+            if first or second:
+                parts = []
+                if first:
+                    parts.append(f"first={first}")
+                if second:
+                    parts.append(f"second={second}")
+                reason = "both eof: " + ", ".join(parts)
+            else:
+                reason = "both eof"
+        self._done_session(sid, session, reason, commands)
 
     def _write_protocol_failure(self, sid: int, session: CoreSession, commands: List[Dict[str, Any]]) -> None:
         if session.mode == "socks":
@@ -5287,6 +6282,9 @@ class RuntimeCore:
     def _write_failure_is_normal_drain(self, session: CoreSession) -> bool:
         return session.draining or session.pipe_stage == "closed"
 
+    def _client_write_failure_is_normal_close(self, session: CoreSession, dest: str) -> bool:
+        return dest == "client" and session.pipe_stage in ("halfClosedClient", "halfClosedRemote")
+
     def _session_context(self, session: CoreSession) -> str:
         phase = {"init": "INIT", "socksAuth": "SOCKS5_AUTH", "socksReq": "SOCKS5_REQ", "httpReq": "HTTP_REQ", "connecting": "CONNECTING", "piping": "PIPING", "closed": "CLOSED"}.get(session.phase, session.phase)
         pipe = {"flowing": "FLOWING", "halfClosedClient": "HALF_CLOSED_CLIENT", "halfClosedRemote": "HALF_CLOSED_REMOTE", "closed": "CLOSED"}.get(session.pipe_stage, session.pipe_stage)
@@ -5346,7 +6344,7 @@ class RuntimeCore:
             "lastFailureNanos": int(raw.get("lastFailureNanos", raw.get("last_failure_nanos", 0)) or 0),
         }
 
-    def _pool_supervisor_snapshot(self, views: List[Dict[str, Any]]) -> None:
+    def _merge_pool_resource_views(self, views: List[Dict[str, Any]]) -> None:
         for raw in views:
             view = self._view_to_slot_dict(raw)
             if view["index"] < 0 or not view["slotId"]:
@@ -5441,14 +6439,11 @@ class RuntimeCore:
         slot.connected = True
         slot.consecutive_failures = 0
         slot.last_failure_nanos = 0
-        slot.health_check_in_flight = False
         slot.reconnect_in_flight = False
         slot.next_reconnect_nanos = 0
 
     def _mark_pool_slot_progress(self, idx: int, slot_id: str) -> None:
         self._mark_pool_slot_success(idx, slot_id)
-        if 0 <= idx < len(self.pool_slots) and self.pool_slots[idx].slot_id == slot_id and self.current_now_nanos > 0:
-            self.pool_slots[idx].next_health_check_nanos = self.current_now_nanos + self.cfg["pool_health_check_interval_nanos"]
 
     def _mark_pool_slot_soft_failed(self, idx: int, slot_id: str) -> None:
         if idx < 0 or not slot_id:
@@ -5458,7 +6453,6 @@ class RuntimeCore:
         slot = self._ensure_pool_slot(idx, slot_id)
         slot.consecutive_failures += 1
         slot.last_failure_nanos = self.current_now_nanos
-        slot.health_check_in_flight = False
         slot.healthy = True
         slot.connected = True
 
@@ -5470,7 +6464,6 @@ class RuntimeCore:
         slot = self._ensure_pool_slot(idx, slot_id)
         slot.consecutive_failures += 1
         slot.last_failure_nanos = self.current_now_nanos
-        slot.health_check_in_flight = False
         if max_fails < 0 or (max_fails > 0 and slot.consecutive_failures >= max_fails):
             slot.healthy = False
             slot.connected = False
@@ -5485,82 +6478,36 @@ class RuntimeCore:
         if slot.reconnect_in_flight:
             return
         slot.reconnect_in_flight = True
-        slot.health_check_in_flight = False
-        slot.health_check_op_id = 0
         slot.reconnect_op_id = self.next_pool_op_id
         self.next_pool_op_id += 1
         slot.next_reconnect_nanos = self.current_now_nanos + self.cfg["pool_reconnect_interval_nanos"]
         commands.append({"type": "reconnectPoolSlot", "poolIdx": idx, "poolOpId": str(slot.reconnect_op_id), "reason": reason})
 
-    def _tick_pool_supervisor(self, commands: List[Dict[str, Any]]) -> None:
+    def _tick_pool_reconnects(self, commands: List[Dict[str, Any]]) -> None:
         if not self.cfg["pool_control_enabled"]:
             return
         for idx, slot in enumerate(self.pool_slots):
-            if slot.connected and slot.healthy:
-                if not self.cfg["pool_supervisor_enabled"]:
-                    continue
-                if not slot.health_check_in_flight and (slot.next_health_check_nanos == 0 or self.current_now_nanos >= slot.next_health_check_nanos):
-                    slot.health_check_in_flight = True
-                    slot.health_check_op_id = self.next_pool_op_id
-                    self.next_pool_op_id += 1
-                    slot.next_health_check_nanos = self.current_now_nanos + self.cfg["pool_health_check_interval_nanos"]
-                    commands.append({"type": "healthCheckPoolSlot", "poolIdx": idx, "poolSlotId": slot.slot_id, "poolOpId": str(slot.health_check_op_id)})
-            elif not slot.reconnect_in_flight and (slot.next_reconnect_nanos == 0 or self.current_now_nanos >= slot.next_reconnect_nanos):
+            if (not slot.connected or not slot.healthy) and not slot.reconnect_in_flight and (slot.next_reconnect_nanos == 0 or self.current_now_nanos >= slot.next_reconnect_nanos):
                 self._schedule_pool_reconnect(idx, "reconnect retry interval elapsed", commands)
 
-    def _pool_slot_health_check_failed(self, idx: int, slot_id: str, pool_op_id: int, reason: str, commands: List[Dict[str, Any]]) -> None:
-        if not self.cfg["pool_control_enabled"] or not self._match_pool_op(idx, "healthCheck", pool_op_id):
-            return
-        if self._is_soft_pool_failure(reason):
-            self._mark_pool_slot_soft_failed(idx, slot_id)
-            return
-        self._mark_pool_slot_failed(idx, slot_id, self.cfg["pool_max_health_failures"], commands)
-        if idx < len(self.pool_slots):
-            slot = self.pool_slots[idx]
-            if not slot.connected or not slot.healthy:
-                self._schedule_pool_reconnect(idx, reason if reason.lower().startswith("health check") else f"health check failed: {reason}", commands)
-
-    def _pool_slot_health_check_unavailable(self, idx: int, slot_id: str, pool_op_id: int) -> None:
-        if not self.cfg["pool_control_enabled"] or not self._match_pool_op(idx, "healthCheck", pool_op_id):
-            return
-        slot = self.pool_slots[idx]
-        if slot.slot_id != slot_id:
-            return
-        slot.health_check_in_flight = False
-        slot.health_check_op_id = 0
-        if self.current_now_nanos > 0:
-            slot.next_health_check_nanos = self.current_now_nanos + self.cfg["pool_health_check_interval_nanos"]
-
-    def _pool_slot_reconnect_ok(self, idx: int, slot_id: str, pool_op_id: int) -> None:
-        if not self.cfg["pool_control_enabled"] or not self._match_pool_op(idx, "reconnect", pool_op_id):
+    def _pool_slot_reconnect_ok(self, idx: int, slot_id: str) -> None:
+        if not self.cfg["pool_control_enabled"] or idx < 0:
             return
         self._mark_pool_slot_success(idx, slot_id)
         slot = self.pool_slots[idx]
         if slot.slot_id == slot_id:
             slot.usage = 0
-            slot.next_health_check_nanos = self.current_now_nanos + self.cfg["pool_health_check_interval_nanos"]
 
-    def _pool_slot_reconnect_failed(self, idx: int, pool_op_id: int) -> None:
+    def _pool_slot_reconnect_failed(self, idx: int) -> None:
         if not self.cfg["pool_control_enabled"] or idx >= len(self.pool_slots):
             return
         slot = self.pool_slots[idx]
-        if not self._match_pool_op(idx, "reconnect", pool_op_id):
-            return
         slot.consecutive_failures += 1
         slot.last_failure_nanos = self.current_now_nanos
         slot.healthy = False
         slot.connected = False
-        slot.health_check_in_flight = False
         slot.reconnect_in_flight = False
         slot.next_reconnect_nanos = self.current_now_nanos + self.cfg["pool_reconnect_interval_nanos"]
-
-    def _match_pool_op(self, idx: int, kind: str, pool_op_id: int) -> bool:
-        if idx < 0 or idx >= len(self.pool_slots) or pool_op_id <= 0:
-            return False
-        slot = self.pool_slots[idx]
-        if kind == "healthCheck":
-            return slot.health_check_in_flight and slot.health_check_op_id == pool_op_id
-        return slot.reconnect_in_flight and slot.reconnect_op_id == pool_op_id
 
     def _system_wake(self, views: List[Dict[str, Any]], slept_nanos: int, commands: List[Dict[str, Any]]) -> None:
         if not self.cfg["pool_control_enabled"]:
@@ -5574,7 +6521,6 @@ class RuntimeCore:
             slot.healthy = False
             slot.connected = False
             slot.last_failure_nanos = self.current_now_nanos
-            slot.health_check_in_flight = False
             slot.reconnect_in_flight = False
             if was_connected:
                 slot.consecutive_failures += 1
@@ -5632,11 +6578,21 @@ def _fmt_secs(nanos: int) -> str:
 
 def _core_config_from_vector(raw: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     raw = raw or {}
-    cfg: Dict[str, Any] = {}
+    cfg: Dict[str, Any] = {
+        "local_only": True,
+        "pool_acquire_timeout_nanos": 5 * NANO,
+        "pool_acquire_retry_interval_nanos": 100_000_000,
+        "max_handshake_buffer": 8192,
+        "handshake_timeout_nanos": 5 * NANO,
+        "pipe_idle_timeout_nanos": 300 * NANO,
+        "install_pipe_enabled": False,
+    }
     if "local_only" in raw:
         cfg["local_only"] = bool(raw["local_only"])
     if "pipe_idle_timeout_seconds" in raw:
         cfg["pipe_idle_timeout_nanos"] = _seconds(raw["pipe_idle_timeout_seconds"])
+    if "install_pipe_enabled" in raw:
+        cfg["install_pipe_enabled"] = bool(raw["install_pipe_enabled"])
     if "pipe_buffer_high_water" in raw:
         cfg["pipe_buffer_high_water"] = int(raw["pipe_buffer_high_water"])
     if "pipe_buffer_low_water" in raw:
@@ -5653,8 +6609,6 @@ def _core_config_from_vector(raw: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         cfg["pool_acquire_retry_interval_nanos"] = _seconds(raw["pool_acquire_retry_interval_seconds"])
     if "pool_max_health_failures" in raw:
         cfg["pool_max_health_failures"] = int(raw["pool_max_health_failures"])
-    if "pool_health_check_interval_seconds" in raw:
-        cfg["pool_health_check_interval_nanos"] = _seconds(raw["pool_health_check_interval_seconds"])
     return cfg
 
 
@@ -5693,11 +6647,12 @@ def _command_alias_matches(cmd: Dict[str, Any], want: str) -> bool:
         "dialSSH": "DialSSH",
         "snapshotPool": "SnapshotPool",
         "markPoolSlotFailed": "MarkPoolSlotFailed",
-        "healthCheckPoolSlot": "HealthCheckPoolSlot",
         "reconnectPoolSlot": "ReconnectPoolSlot",
         "close": "Close",
         "closeWrite": "CloseWrite",
         "releasePayload": "ReleasePayload",
+        "releaseBuffer": "ReleaseBuffer",
+        "writeSpan": "WriteSpan",
         "logSessionDone": "LogSessionDone",
         "logSessionFreed": "LogSessionFreed",
         "logSessionFailed": "LogSessionFailure",
@@ -5712,6 +6667,7 @@ def _command_alias_matches(cmd: Dict[str, Any], want: str) -> bool:
         or (norm_want == "dial" and actual in ("dialDirect", "dialSSH"))
         or (norm_want == "write" and actual == "writeInline")
         or (norm_want == "snapshot" and actual == "snapshotPool")
+        or (norm_want == "installpipe" and actual == "installPipe")
     )
 
 
@@ -5720,16 +6676,34 @@ def _command_matches(cmd: Dict[str, Any], want: Dict[str, Any]) -> bool:
         return False
     if "handle" in want and cmd.get("handle") != int(want["handle"]):
         return False
+    if "client_handle" in want and cmd.get("clientHandle") != int(want["client_handle"]):
+        return False
     if "remote_handle" in want and cmd.get("remoteHandle") != int(want["remote_handle"]):
+        return False
+    if "mode" in want and cmd.get("mode") != want["mode"]:
         return False
     if "source" in want and cmd.get("source") != want["source"].lower():
         return False
     if "dest" in want and cmd.get("dest") != want["dest"].lower():
         return False
+    if "frame_mode" in want and cmd.get("frameMode") != want["frame_mode"]:
+        return False
+    if "frameMode" in want and cmd.get("frameMode") != want["frameMode"]:
+        return False
     if "pool_idx" in want and cmd.get("poolIdx") != int(want["pool_idx"]):
         return False
     if "pool_slot_id" in want and cmd.get("poolSlotId") != want["pool_slot_id"]:
         return False
+    if "buffer_id" in want:
+        span = cmd.get("span") or {}
+        buffer = cmd.get("buffer") or span.get("buffer") or {}
+        if str(buffer.get("id")) != str(want["buffer_id"]):
+            return False
+    if "buffer_gen" in want:
+        span = cmd.get("span") or {}
+        buffer = cmd.get("buffer") or span.get("buffer") or {}
+        if int(buffer.get("gen", 0)) != int(want["buffer_gen"]):
+            return False
     if "payload_id" in want:
         payload = cmd.get("payload")
         if payload is None or payload.get("id") != str(want["payload_id"]):
@@ -5750,6 +6724,31 @@ def _command_matches(cmd: Dict[str, Any], want: Dict[str, Any]) -> bool:
         return False
     if "level" in want and cmd.get("level") != want["level"]:
         return False
+    if "initial_writes" in want:
+        got_writes = (cmd.get("initial") or {}).get("beforePipeWrites", [])
+        want_writes = want["initial_writes"]
+        if len(got_writes) != len(want_writes):
+            return False
+        for got, expected in zip(got_writes, want_writes):
+            if expected.get("dest") and got.get("dest") != expected["dest"].lower():
+                return False
+            if "text" in expected:
+                raw = got.get("bytes", b"")
+                if isinstance(raw, bytes):
+                    if raw.decode("utf-8", errors="replace") != expected["text"]:
+                        return False
+                elif raw != expected["text"]:
+                    return False
+            span = got.get("span") or {}
+            buf = span.get("buffer") or {}
+            if "buffer_id" in expected and str(buf.get("id")) != str(expected["buffer_id"]):
+                return False
+            if "buffer_gen" in expected and int(buf.get("gen", 0)) != int(expected["buffer_gen"]):
+                return False
+            if "raw_offset" in expected and int(span.get("offset", 0)) != int(expected["raw_offset"]):
+                return False
+            if "raw_len" in expected and int(span.get("len", 0)) != int(expected["raw_len"]):
+                return False
     return True
 
 
@@ -5771,33 +6770,35 @@ def _completion_for_core_step(step: Dict[str, Any], saved: Dict[str, Dict[str, A
         return {"type": "updateTime", "nowNanos": _seconds(step["now"])}
     if op == "tick":
         return {"type": "tick", "nowNanos": _seconds(step["now"])}
-    if op == "pool_supervisor_snapshot":
-        return {"type": "poolSupervisorSnapshot", "poolViews": _pool_views(step.get("views"))}
     if op == "system_wake":
         return {"type": "systemWake", "nowNanos": int(step["now"]), "sleptNanos": int(step["slept_nanos"]), "poolViews": _pool_views(step.get("views"))}
     if op == "pool_snapshot":
         return {"type": "poolSnapshot", "token": (use_cmd or saved["snapshot_req"])["token"], "poolViews": _pool_views(step.get("views"))}
-    if op == "pool_health_failed":
-        cmd = use_cmd or saved.get("health") or next(c for c in reversed(last) if c["type"] == "healthCheckPoolSlot")
-        return {"type": "poolSlotHealthCheckFailed", "poolIdx": int(step["pool_idx"]), "poolSlotId": step["pool_slot_id"], "poolOpId": cmd["poolOpId"], "error": step["reason"]}
-    if op == "pool_health_unavailable":
-        cmd = use_cmd or saved.get("health") or next(c for c in reversed(last) if c["type"] == "healthCheckPoolSlot")
-        return {
-            "type": "poolSlotHealthCheckUnavailable",
-            "poolIdx": int(step["pool_idx"]),
-            "poolSlotId": step["pool_slot_id"],
-            "poolOpId": cmd["poolOpId"],
-            "error": step.get("reason", "health check executor unavailable"),
-            "nowNanos": _seconds(step["now"]) if "now" in step else None,
-        }
     if op == "pool_slot_progress":
         return {"type": "poolSlotProgress", "poolIdx": int(step["pool_idx"]), "poolSlotId": step["pool_slot_id"], "nowNanos": _seconds(step["now"]) if "now" in step else None}
     if op == "pool_reconnect_ok":
-        cmd = use_cmd or saved.get("reconnect_0") or next(c for c in reversed(last) if c["type"] == "reconnectPoolSlot")
-        return {"type": "poolSlotReconnectOK", "poolIdx": int(step["pool_idx"]), "poolSlotId": step["pool_slot_id"], "poolOpId": cmd["poolOpId"]}
+        return {"type": "poolSlotReconnectOK", "poolIdx": int(step["pool_idx"]), "poolSlotId": step["pool_slot_id"]}
     if op == "pool_reconnect_failed":
-        cmd = use_cmd or saved.get("reconnect_0") or next(c for c in reversed(last) if c["type"] == "reconnectPoolSlot")
-        return {"type": "poolSlotReconnectFailed", "poolIdx": int(step["pool_idx"]), "poolOpId": cmd["poolOpId"], "error": step["reason"]}
+        return {"type": "poolSlotReconnectFailed", "poolIdx": int(step["pool_idx"]), "error": step["reason"]}
+    if op == "read_frame":
+        cmd = use_cmd or reads.get(step["source"].lower()) or next(c for c in reversed(last) if c["type"] == "read" and c["source"] == step["source"].lower())
+        data = _spec_bytes(step)
+        protocol_len = int(step.get("raw_offset", len(data)))
+        return {
+            "type": "readFrame",
+            "token": cmd["token"],
+            "handle": cmd["handle"],
+            "source": step["source"].lower(),
+            "frameKind": step.get("frame_kind", "initialUnknown"),
+            "frame": {
+                "buffer": {"id": str(step.get("buffer_id", 1)), "gen": int(step.get("buffer_gen", 1))},
+                "protocolOffset": 0,
+                "protocolLen": protocol_len,
+                "rawOffset": int(step.get("raw_offset", protocol_len)),
+                "rawLen": int(step.get("raw_len", 0)),
+            },
+            "protocolBytes": data[:protocol_len],
+        }
     if op == "read_done":
         cmd = use_cmd or reads.get(step["source"].lower()) or next(c for c in reversed(last) if c["type"] == "read" and c["source"] == step["source"].lower())
         return {"type": "readDone", "token": cmd["token"], "handle": cmd["handle"], "source": step["source"].lower(), "data": _spec_bytes(step), "payload": _payload_ref(step)}
@@ -5813,6 +6814,29 @@ def _completion_for_core_step(step: Dict[str, Any], saved: Dict[str, Dict[str, A
     if op == "write_failed":
         cmd = use_cmd or next(c for c in reversed(last) if c["type"] == "writeInline" and c["dest"] == step["dest"].lower())
         return {"type": "writeFailed", "token": cmd["token"], "handle": cmd["handle"], "dest": cmd["dest"], "error": step["reason"], "payload": cmd.get("payload")}
+    if op == "pipe_installed":
+        cmd = use_cmd or saved.get("install_pipe") or next(c for c in reversed(last) if c["type"] == "installPipe")
+        return {"type": "pipeInstalled", "token": cmd["token"], "clientHandle": cmd["clientHandle"], "remoteHandle": cmd["remoteHandle"]}
+    if op == "pipe_progress":
+        cmd = use_cmd or saved.get("install_pipe") or next(c for c in reversed(last) if c["type"] == "installPipe")
+        return {
+            "type": "pipeProgress",
+            "token": cmd["token"],
+            "bytesUp": str(int(step.get("bytes_up", 0))),
+            "bytesDown": str(int(step.get("bytes_down", 0))),
+            "nowNanos": _seconds(step["now"]),
+        }
+    if op == "pipe_closed":
+        cmd = use_cmd or saved.get("install_pipe") or next(c for c in reversed(last) if c["type"] == "installPipe")
+        return {
+            "type": "pipeClosed",
+            "token": cmd["token"],
+            "reason": step.get("reason", "bothDirectionsClosed"),
+            "first": step.get("first"),
+            "second": step.get("second"),
+            "bytesUp": str(int(step.get("bytes_up", 0))),
+            "bytesDown": str(int(step.get("bytes_down", 0))),
+        }
     if op == "dial_done":
         cmd = use_cmd or saved["dial"]
         return {"type": "dialDone", "token": cmd["token"], "remoteHandle": int(step["remote_handle"]), "poolIdx": int(cmd.get("poolIdx", -1)), "poolSlotId": cmd.get("poolSlotId", "")}
@@ -5861,10 +6885,6 @@ def _assert_core_state(vector_id: str, step_index: int, core: RuntimeCore, step:
             assert slot.usage == int(expected["usage"])
         if "consecutive_failures" in expected:
             assert slot.consecutive_failures == int(expected["consecutive_failures"])
-        if "health_check_in_flight" in expected:
-            assert slot.health_check_in_flight == bool(expected["health_check_in_flight"])
-        if "next_health_check_seconds" in expected:
-            assert slot.next_health_check_nanos == _seconds(expected["next_health_check_seconds"])
 
 
 def _run_json_core_vectors() -> bool:
@@ -5879,7 +6899,7 @@ def _run_json_core_vectors() -> bool:
         try:
             for idx, step in enumerate(vector["steps"]):
                 completion = _completion_for_core_step(step, saved, last, reads)
-                if completion["type"] in ("readDone", "readEOF", "readError"):
+                if completion["type"] in ("readFrame", "readDone", "readEOF", "readError"):
                     reads.pop(completion["source"], None)
                 commands = core.step(completion)
                 if "save_command" in step:
@@ -6319,6 +7339,43 @@ async def periodic_stats(state: ServerState, log: logging.Logger):
         pass
 
 
+SYSTEM_WAKE_GAP_SECONDS = 30.0
+
+
+async def deliver_system_wake_to_shard0(
+    cfg: Config,
+    state: ServerState,
+    log: logging.Logger,
+    gap_seconds: float,
+) -> None:
+    if state.pool_control is None:
+        return
+    log.info(f"system wake detected: timer gap {gap_seconds:.1f}s, reconnecting SSH pool")
+    views = [_pool_view_to_core_dict(view) for view in snapshot_slots(state.pool.slots) if view is not None]
+    await state.pool_control.completions.put({
+        "type": "systemWake",
+        "nowNanos": time.time_ns(),
+        "sleptNanos": int(gap_seconds * NANO),
+        "poolViews": views,
+    })
+
+
+async def system_wake_loop(cfg: Config, state: ServerState, log: logging.Logger):
+    if state.pool_control is None or state.pool is None:
+        return
+    last_tick = time.monotonic()
+    try:
+        while not state.shutdown_event.is_set():
+            await asyncio.sleep(0.1)
+            now = time.monotonic()
+            gap = now - last_tick
+            if gap >= SYSTEM_WAKE_GAP_SECONDS:
+                await deliver_system_wake_to_shard0(cfg, state, log, gap)
+            last_tick = now
+    except asyncio.CancelledError:
+        return
+
+
 async def graceful_shutdown(cfg: Config, state: ServerState, log: logging.Logger):
     if state.server:
         state.server.close()
@@ -6345,6 +7402,14 @@ async def graceful_shutdown(cfg: Config, state: ServerState, log: logging.Logger
             task.cancel()
     if state.shard_tasks:
         await asyncio.gather(*state.shard_tasks, return_exceptions=True)
+    if state.wake_task and not state.wake_task.done():
+        state.wake_task.cancel()
+        await asyncio.gather(state.wake_task, return_exceptions=True)
+    if state.pool_control_task and not state.pool_control_task.done():
+        if state.pool_control is not None:
+            state.pool_control.closed = True
+        state.pool_control_task.cancel()
+        await asyncio.gather(state.pool_control_task, return_exceptions=True)
 
     if state.active_tasks:
         log.info(f"Waiting for {len(state.active_tasks)} active connections...")
@@ -6405,6 +7470,9 @@ async def run_server(cfg: Config):
     state = ServerState(pool=init_pool_state(cfg.pool_size))
     if not cfg.local_only:
         await init_pool(cfg, state.pool, log)
+        state.pool_control = PoolControlWorld(cfg, state, log, shard_idx=0)
+        state.pool_control_task = asyncio.create_task(state.pool_control.run())
+        state.wake_task = asyncio.create_task(system_wake_loop(cfg, state, log))
     else:
         log.info("Running in DIRECT mode (no SSH tunnel)")
     state.shard_queues = [asyncio.Queue() for _ in range(cfg.event_loop_shards)]
